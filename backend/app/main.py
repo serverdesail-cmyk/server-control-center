@@ -1,4 +1,6 @@
 import ctypes
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -10,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import threading
 import time
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
@@ -24,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_ATTEMPTS = 8
@@ -57,6 +60,7 @@ class Settings:
     setup_token: str
     cookie_secure: bool = True
     max_upload_bytes: int = UPLOAD_LIMIT
+    host_proc_dir: Path = Path("/host/proc")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,6 +118,13 @@ class GrantBody(BaseModel):
     inherit: bool = True
 
 
+class FilesystemRootBody(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+class ProfileBody(BaseModel):
+    avatar: str | None = Field(default=None, max_length=180_000)
+
+
 class CreateBody(BaseModel):
     path: str = Field(max_length=4096)
     name: str = Field(min_length=1, max_length=255)
@@ -169,6 +180,9 @@ def initialize(settings: Settings) -> None:
         os.chmod(settings.data_dir, 0o700)
     if not settings.filesystem_root.is_dir():
         raise RuntimeError(f"Filesystem root does not exist: {settings.filesystem_root}")
+    base_root = settings.filesystem_root.resolve(strict=True)
+    if base_root == Path("/"):
+        raise RuntimeError("The configured filesystem mount cannot be /")
     with closing(connect(settings.database_path)) as db:
         db.execute("PRAGMA journal_mode = WAL")
         db.executescript(
@@ -179,6 +193,7 @@ def initialize(settings: Settings) -> None:
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'user')),
                 active INTEGER NOT NULL DEFAULT 1,
+                avatar TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_scc_owner
@@ -216,11 +231,159 @@ def initialize(settings: Settings) -> None:
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS audit_created_at ON audit(created_at);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
+        user_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "avatar" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+        db.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('active_filesystem_root', ?)",
+            (str(base_root),),
+        )
+        configured_root = db.execute(
+            "SELECT value FROM app_settings WHERE key = 'active_filesystem_root'"
+        ).fetchone()["value"]
+        try:
+            active_root = Path(configured_root).resolve(strict=True)
+            valid_root = active_root.is_dir() and active_root.is_relative_to(base_root)
+        except (OSError, RuntimeError):
+            valid_root = False
+            active_root = base_root
+        if not valid_root:
+            db.execute("DELETE FROM grants")
+            db.execute(
+                "UPDATE app_settings SET value = ? WHERE key = 'active_filesystem_root'",
+                (str(base_root),),
+            )
+            db.execute(
+                "INSERT INTO audit (user_id, action, path, detail, created_at) "
+                "VALUES (NULL, 'filesystem_root_reset', ?, ?, ?)",
+                (str(base_root), str(configured_root), now()),
+            )
         db.commit()
     if os.name == "posix":
         os.chmod(settings.database_path, 0o600)
+
+
+def active_filesystem_root(settings: Settings) -> Path:
+        with closing(connect(settings.database_path)) as db:
+            row = db.execute(
+                "SELECT value FROM app_settings WHERE key = 'active_filesystem_root'"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Active filesystem root setting is missing")
+        root = Path(row["value"])
+        try:
+            resolved_root = root.resolve(strict=True)
+            base_root = settings.filesystem_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail="Configured filesystem root is unavailable") from exc
+        if not resolved_root.is_dir() or not resolved_root.is_relative_to(base_root):
+            raise HTTPException(status_code=503, detail="Configured filesystem root is outside its mounted boundary")
+        return resolved_root
+
+
+def resolve_managed_directory(settings: Settings, requested_path: str) -> tuple[Path, tuple[str, ...]]:
+        if (
+            not requested_path.startswith("/")
+            or "\x00" in requested_path
+            or "\\" in requested_path
+            or ".." in requested_path.split("/")
+        ):
+            raise HTTPException(status_code=400, detail="Choose an absolute directory without traversal components")
+        base_root = settings.filesystem_root.resolve(strict=True)
+        try:
+            resolved_path = Path(requested_path).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=404, detail="Directory not found") from exc
+        if not resolved_path.is_dir():
+            raise HTTPException(status_code=400, detail="The selected path is not a directory")
+        try:
+            relative = resolved_path.relative_to(base_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail="Directory is outside the configured host mount") from exc
+        return resolved_path, relative.parts
+
+
+def host_metrics(
+    settings: Settings,
+    previous_sample: tuple[int, int, float] | None,
+) -> tuple[dict[str, Any], tuple[int, int, float]]:
+        try:
+            cpu_line = (settings.host_proc_dir / "stat").read_text(encoding="ascii").splitlines()[0].split()
+            if cpu_line[0] != "cpu" or len(cpu_line) < 5:
+                raise ValueError("Host CPU counters are unavailable")
+            counters = [int(value) for value in cpu_line[1:]]
+            total_ticks = sum(counters[:8])
+            idle_ticks = counters[3] + (counters[4] if len(counters) > 4 else 0)
+
+            memory = {}
+            for line in (settings.host_proc_dir / "meminfo").read_text(encoding="ascii").splitlines():
+                key, separator, value = line.partition(":")
+                if separator:
+                    memory[key] = int(value.strip().split()[0]) * 1024
+            total_memory = memory["MemTotal"]
+            available_memory = memory["MemAvailable"]
+            if total_memory <= 0 or not 0 <= available_memory <= total_memory:
+                raise ValueError("Host memory counters are invalid")
+
+            uptime_seconds = float((settings.host_proc_dir / "uptime").read_text(encoding="ascii").split()[0])
+            load_average = [
+                float(value)
+                for value in (settings.host_proc_dir / "loadavg").read_text(encoding="ascii").split()[:3]
+            ]
+            if len(load_average) != 3:
+                raise ValueError("Host load average is unavailable")
+
+            received_bytes = 0
+            transmitted_bytes = 0
+            network_lines = (settings.host_proc_dir / "net" / "dev").read_text(encoding="ascii").splitlines()[2:]
+            for line in network_lines:
+                interface, separator, counters_text = line.partition(":")
+                if not separator or interface.strip() == "lo":
+                    continue
+                values = counters_text.split()
+                if len(values) < 9:
+                    raise ValueError("Host network counters are invalid")
+                received_bytes += int(values[0])
+                transmitted_bytes += int(values[8])
+        except (OSError, IndexError, KeyError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Host telemetry is unavailable or invalid") from exc
+
+        sampled_at = time.monotonic()
+        cpu_percent = None
+        if previous_sample is not None:
+            previous_total, previous_idle, previous_at = previous_sample
+            total_delta = total_ticks - previous_total
+            idle_delta = idle_ticks - previous_idle
+            if total_delta > 0 and 0 <= idle_delta <= total_delta:
+                cpu_percent = round((total_delta - idle_delta) * 100 / total_delta, 1)
+
+        sample = (total_ticks, idle_ticks, sampled_at)
+        return (
+            {
+                "cpu_percent": cpu_percent,
+                "memory": {
+                    "total": total_memory,
+                    "used": total_memory - available_memory,
+                    "available": available_memory,
+                },
+                "uptime_seconds": int(uptime_seconds),
+                "load_average": load_average,
+                "network": {
+                    "received_bytes": received_bytes,
+                    "transmitted_bytes": transmitted_bytes,
+                },
+                "sampled_at": time.time(),
+            },
+            sample,
+        )
 
 
 def digest(value: str) -> str:
@@ -492,6 +655,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = config
     app.state.started_at = time.time()
+    app.state.host_metrics_sample = None
+    app.state.host_metrics_lock = threading.Lock()
     app.mount("/assets", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 
     def current_user(request: Request) -> sqlite3.Row:
@@ -551,7 +716,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.commit()
         issue_session(response, config, user_id)
         audit_event(config, {"id": user_id}, "owner_created")
-        return {"username": username, "role": "owner"}
+        return {"id": user_id, "username": username, "role": "owner"}
 
     def issue_session(response: Response, cfg: Settings, user_id: int) -> None:
         session_token = secrets.token_urlsafe(32)
@@ -610,7 +775,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.commit()
         issue_session(response, config, user["id"])
         audit_event(config, user, "login")
-        return {"username": user["username"], "role": user["role"]}
+        return {"id": user["id"], "username": user["username"], "role": user["role"]}
 
     @app.post("/api/auth/logout")
     async def logout(request: Request, response: Response, user: CurrentUser):
@@ -627,6 +792,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def me(user: CurrentUser):
         return {"id": user["id"], "username": user["username"], "role": user["role"]}
 
+    @app.get("/api/profile")
+    async def get_profile(user: CurrentUser):
+        with closing(connect(config.database_path)) as db:
+            profile = db.execute(
+                "SELECT avatar FROM users WHERE id = ?", (user["id"],)
+            ).fetchone()
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return {
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
+            "avatar": profile["avatar"],
+        }
+
+    @app.put("/api/profile")
+    async def update_profile(body: ProfileBody, user: CurrentUser):
+        avatar = body.avatar
+        if avatar is not None:
+            prefix, separator, encoded = avatar.partition(",")
+            mime_types = {
+                "data:image/jpeg;base64": "jpeg",
+                "data:image/png;base64": "png",
+                "data:image/webp;base64": "webp",
+            }
+            image_type = mime_types.get(prefix)
+            if not separator or image_type is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Profile picture must be a JPEG, PNG, or WebP image",
+                )
+            try:
+                image_bytes = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Profile picture data is invalid") from exc
+            if not image_bytes or len(image_bytes) > 128 * 1024:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Profile picture must be no larger than 128 KiB",
+                )
+            valid_signature = (
+                image_bytes.startswith(b"\xff\xd8\xff")
+                if image_type == "jpeg"
+                else image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                if image_type == "png"
+                else image_bytes.startswith(b"RIFF")
+                and image_bytes[8:12] == b"WEBP"
+            )
+            if not valid_signature:
+                raise HTTPException(status_code=400, detail="Profile picture format does not match its data")
+
+        with closing(connect(config.database_path)) as db:
+            db.execute("UPDATE users SET avatar = ? WHERE id = ?", (avatar, user["id"]))
+            db.commit()
+        audit_event(config, user, "profile_picture_updated")
+        return {"avatar": avatar}
+
     @app.put("/api/auth/password")
     async def change_own_password(body: PasswordBody, user: CurrentUser):
         with closing(connect(config.database_path)) as db:
@@ -641,47 +863,184 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/dashboard")
     async def dashboard(user: CurrentUser):
-        disk = shutil.disk_usage(config.filesystem_root)
+        filesystem_root = active_filesystem_root(config)
+        disk = shutil.disk_usage(filesystem_root)
         with closing(connect(config.database_path)) as db:
             sessions = db.execute(
                 "SELECT COUNT(*) AS count FROM sessions WHERE expires_at > ?", (now(),)
             ).fetchone()["count"]
-            audit = db.execute(
-                """
+            audit_query = """
                 SELECT a.action, a.path, a.detail, a.created_at, u.username
                 FROM audit a LEFT JOIN users u ON u.id = a.user_id
-                ORDER BY a.created_at DESC LIMIT 12
-                """
-            ).fetchall()
+            """
+            if user["role"] != "owner":
+                audit_query += " WHERE a.user_id = ?"
+                audit = db.execute(
+                    audit_query + " ORDER BY a.created_at DESC LIMIT 12",
+                    (user["id"],),
+                ).fetchall()
+            else:
+                audit = db.execute(
+                    audit_query + " ORDER BY a.created_at DESC LIMIT 12"
+                ).fetchall()
         return {
             "version": APP_VERSION,
             "uptime_seconds": int(time.time() - app.state.started_at),
-            "filesystem_root": str(config.filesystem_root),
+            "filesystem_root": str(filesystem_root),
+            "filesystem_mount_root": str(config.filesystem_root.resolve(strict=True)),
             "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
             "active_sessions": sessions if user["role"] == "owner" else None,
-            "recent_activity": (
-                [
-                    {
-                        "action": row["action"],
-                        "path": row["path"],
-                        "detail": row["detail"],
-                        "created_at": row["created_at"],
-                        "username": row["username"],
-                    }
-                    for row in audit
-                ]
-                if user["role"] == "owner"
-                else []
-            ),
+            "recent_activity": [
+                {
+                    "action": row["action"],
+                    "path": row["path"],
+                    "detail": row["detail"],
+                    "created_at": row["created_at"],
+                    "username": row["username"],
+                }
+                for row in audit
+            ],
         }
+
+    @app.get("/api/system/metrics")
+    async def system_metrics(_: CurrentUser):
+        with app.state.host_metrics_lock:
+            metrics, app.state.host_metrics_sample = host_metrics(
+                config, app.state.host_metrics_sample
+            )
+        return metrics
+
+    @app.get("/api/owner/filesystem")
+    async def owner_filesystem(user: CurrentUser, path: str | None = None):
+        require_owner(user)
+        mount_root = config.filesystem_root.resolve(strict=True)
+        current_root = active_filesystem_root(config)
+        resolved_path, relative_parts = resolve_managed_directory(
+            config, path if path is not None else str(current_root)
+        )
+        fd = open_directory(mount_root, relative_parts)
+        try:
+            directories = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        directories.append(
+                            {"name": entry.name, "path": str(resolved_path / entry.name)}
+                        )
+            directories.sort(key=lambda item: item["name"].casefold())
+            return {
+                "mount_root": str(mount_root),
+                "active_root": str(current_root),
+                "path": str(resolved_path),
+                "parent": (
+                    str(resolved_path.parent)
+                    if resolved_path != mount_root
+                    else None
+                ),
+                "directories": directories[:500],
+                "truncated": len(directories) > 500,
+            }
+        finally:
+            os.close(fd)
+
+    @app.post("/api/owner/filesystem-root")
+    async def set_owner_filesystem_root(body: FilesystemRootBody, user: CurrentUser):
+        require_owner(user)
+        new_root, _ = resolve_managed_directory(config, body.path)
+        with closing(connect(config.database_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            setting = db.execute(
+                "SELECT value FROM app_settings WHERE key = 'active_filesystem_root'"
+            ).fetchone()
+            if setting is None:
+                raise HTTPException(status_code=500, detail="Filesystem root setting is missing")
+            old_root = Path(setting["value"])
+            if old_root == new_root:
+                db.commit()
+                return {
+                    "filesystem_root": str(new_root),
+                    "remapped_grants": 0,
+                    "removed_grants": 0,
+                }
+
+            remapped_grants = 0
+            removed_grants = 0
+            grants = db.execute("SELECT id, path FROM grants ORDER BY id").fetchall()
+            for grant_row in grants:
+                grant_path = old_root.joinpath(*canonical_parts(grant_row["path"]))
+                try:
+                    relative_path = grant_path.relative_to(new_root)
+                except ValueError:
+                    db.execute("DELETE FROM grants WHERE id = ?", (grant_row["id"],))
+                    removed_grants += 1
+                else:
+                    db.execute(
+                        "UPDATE grants SET path = ? WHERE id = ?",
+                        (virtual_path(relative_path.parts), grant_row["id"]),
+                    )
+                    remapped_grants += 1
+            db.execute(
+                "UPDATE app_settings SET value = ? WHERE key = 'active_filesystem_root'",
+                (str(new_root),),
+            )
+            db.execute(
+                "INSERT INTO audit (user_id, action, path, detail, created_at) "
+                "VALUES (?, 'filesystem_root_changed', ?, ?, ?)",
+                (
+                    user["id"],
+                    str(new_root),
+                    f"previous={old_root}; remapped_grants={remapped_grants}; removed_grants={removed_grants}",
+                    now(),
+                ),
+            )
+            db.commit()
+        return {
+            "filesystem_root": str(new_root),
+            "remapped_grants": remapped_grants,
+            "removed_grants": removed_grants,
+        }
+
+    @app.get("/api/activity")
+    async def list_activity(user: CurrentUser, limit: int = 50):
+        if not 1 <= limit <= 100:
+            raise HTTPException(status_code=400, detail="Activity limit must be between 1 and 100")
+        with closing(connect(config.database_path)) as db:
+            query = """
+                SELECT a.action, a.path, a.detail, a.created_at, u.username
+                FROM audit a LEFT JOIN users u ON u.id = a.user_id
+            """
+            if user["role"] == "owner":
+                rows = db.execute(
+                    query + " ORDER BY a.created_at DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    query + " WHERE a.user_id = ? ORDER BY a.created_at DESC LIMIT ?",
+                    (user["id"], limit),
+                ).fetchall()
+        return [
+            {
+                "action": row["action"],
+                "path": row["path"],
+                "detail": row["detail"],
+                "created_at": row["created_at"],
+                "username": row["username"],
+            }
+            for row in rows
+        ]
 
     @app.get("/api/files")
     async def list_files(user: CurrentUser, path: str = "/"):
         parts = canonical_parts(path)
         target = virtual_path(parts)
+        filesystem_root = active_filesystem_root(config)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "browse")
-            fd = open_directory(config.filesystem_root, parts)
+            fd = open_directory(filesystem_root, parts)
             try:
                 items = []
                 with os.scandir(fd) as entries:
@@ -727,7 +1086,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = virtual_path(parts)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "read")
-        parent_fd, name = open_parent(config.filesystem_root, parts)
+        parent_fd, name = open_parent(active_filesystem_root(config), parts)
         try:
             try:
                 fd = os.open(name, os.O_RDONLY | NONBLOCK | NOFOLLOW | CLOEXEC, dir_fd=parent_fd)
@@ -771,7 +1130,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = virtual_path(parts)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "download")
-        parent_fd, name = open_parent(config.filesystem_root, parts)
+        parent_fd, name = open_parent(active_filesystem_root(config), parts)
         try:
             fd = os.open(name, os.O_RDONLY | NONBLOCK | NOFOLLOW | CLOEXEC, dir_fd=parent_fd)
         except FileNotFoundError as exc:
@@ -821,7 +1180,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         parent_path = virtual_path(parent_parts)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, parent_path, "create")
-        fd = open_directory(config.filesystem_root, parent_parts)
+        fd = open_directory(active_filesystem_root(config), parent_parts)
         try:
             os.mkdir(body.name, mode=0o700, dir_fd=fd)
         except FileExistsError as exc:
@@ -846,7 +1205,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = body.content.encode("utf-8")
         if len(data) > TEXT_FILE_LIMIT:
             raise HTTPException(status_code=413, detail="Text content exceeds the file limit")
-        parent_fd = open_directory(config.filesystem_root, parts[:-1])
+        parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
         try:
             fd = os.open(
                 parts[-1],
@@ -881,7 +1240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = body.content.encode("utf-8")
         if len(data) > TEXT_FILE_LIMIT:
             raise HTTPException(status_code=413, detail="Text content exceeds the file limit")
-        parent_fd = open_directory(config.filesystem_root, parts[:-1])
+        parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
         try:
             try:
                 fd = os.open(
@@ -923,7 +1282,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "rename")
             require_permission(db, user, virtual_path(parts[:-1]), "rename")
-        parent_fd = open_directory(config.filesystem_root, parts[:-1])
+        parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
         try:
             rename_without_replace(parent_fd, parts[-1], parent_fd, body.name)
         finally:
@@ -940,7 +1299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = virtual_path(parts)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "delete")
-        parent_fd = open_directory(config.filesystem_root, parts[:-1])
+        parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
         try:
             try:
                 entry_stat = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
@@ -973,7 +1332,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         check_filename(file.filename or "")
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "upload")
-        parent_fd = open_directory(config.filesystem_root, parts)
+        parent_fd = open_directory(active_filesystem_root(config), parts)
         temporary_name = f".scc-upload-{secrets.token_hex(16)}"
         temporary_fd: int | None = None
         total = 0
@@ -1140,7 +1499,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Active user not found")
             if target_user["role"] == "owner":
                 raise HTTPException(status_code=400, detail="The owner does not need folder grants")
-        fd = open_directory(config.filesystem_root, path_parts)
+        fd = open_directory(active_filesystem_root(config), path_parts)
         os.close(fd)
         with closing(connect(config.database_path)) as db:
             db.execute(
