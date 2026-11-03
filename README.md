@@ -36,7 +36,7 @@ ngrok http http://127.0.0.1:8787
 
 Open the HTTPS URL displayed by ngrok. SCC still requires its own login; ngrok is only the transport.
 
-To allow direct LAN access, edit `/opt/server-control-center/.env` and set `SCC_BIND_ADDRESS` to the server's LAN address, then apply the change:
+To allow direct LAN access, edit `/opt/server-control-center/.env` and set `SCC_BIND_ADDRESS` to the server's LAN address, then apply the change. `sudo scc restart` recreates the container so updated environment and mount settings take effect:
 
 ```sh
 sudo scc restart
@@ -48,7 +48,7 @@ Configure the host firewall before doing this. `SCC_COOKIE_SECURE=true` is the r
 
 By default, the only host directory mounted into the application is `/srv`. The entire host filesystem and Docker socket are not mounted. The OWNER can grant application permissions beneath this configured root; the container's numeric user must also have the relevant Linux filesystem permissions. SCC does not change host ownership or mode bits.
 
-To use a different dedicated host directory, stop the service, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, and run `sudo scc restart`. The host root must not contain a colon. Only that one directory is mounted into the container.
+To use a different dedicated host directory, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, then run `sudo scc restart` to recreate the container with the new mount. The host root must not contain a colon. Only that one directory is mounted into the container.
 
 SCC uses descriptor-relative Linux filesystem operations, refuses symbolic-link traversal, rejects `..` path components, and does not permit overwriting an existing file during upload or rename. Upload data is streamed in bounded chunks (1 GiB maximum by default); downloads support HTTP byte ranges. Text editing is limited to UTF-8 files up to 1 MiB.
 
