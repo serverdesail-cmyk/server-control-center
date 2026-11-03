@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_ATTEMPTS = 8
@@ -45,6 +45,15 @@ PERMISSIONS = {
     "rename",
     "delete",
 }
+DEFAULT_DASHBOARD_PREFERENCES = {
+    "widgets": ["stats", "activity", "filesystem", "quick-actions"],
+    "quick_actions": ["files", "monitoring", "logs", "access", "settings"],
+    "cpu_warning_percent": 85,
+    "memory_warning_percent": 90,
+    "disk_warning_percent": 90,
+}
+DASHBOARD_WIDGETS = {"stats", "activity", "filesystem", "quick-actions"}
+DASHBOARD_ACTIONS = {"files", "monitoring", "logs", "access", "settings"}
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
@@ -123,6 +132,14 @@ class FilesystemRootBody(BaseModel):
 
 class ProfileBody(BaseModel):
     avatar: str | None = Field(default=None, max_length=180_000)
+
+
+class DashboardPreferencesBody(BaseModel):
+    widgets: list[str] = Field(max_length=len(DASHBOARD_WIDGETS))
+    quick_actions: list[str] = Field(max_length=len(DASHBOARD_ACTIONS))
+    cpu_warning_percent: int = Field(ge=50, le=99)
+    memory_warning_percent: int = Field(ge=50, le=99)
+    disk_warning_percent: int = Field(ge=50, le=99)
 
 
 class CreateBody(BaseModel):
@@ -236,6 +253,10 @@ def initialize(settings: Settings) -> None:
                 value TEXT NOT NULL
             );
             """
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('dashboard_preferences', ?)",
+            (json.dumps(DEFAULT_DASHBOARD_PREFERENCES, separators=(",", ":")),),
         )
         user_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()
@@ -550,6 +571,35 @@ def require_owner(user: sqlite3.Row) -> None:
         raise HTTPException(status_code=403, detail="Owner access required")
 
 
+def valid_dashboard_preferences(preferences: dict[str, Any]) -> bool:
+    widgets = preferences.get("widgets")
+    actions = preferences.get("quick_actions")
+    return (
+        isinstance(widgets, list)
+        and len(widgets) == len(set(widgets))
+        and set(widgets) <= DASHBOARD_WIDGETS
+        and isinstance(actions, list)
+        and len(actions) == len(set(actions))
+        and set(actions) <= DASHBOARD_ACTIONS
+    )
+
+
+def read_dashboard_preferences(settings: Settings) -> dict[str, Any]:
+    with closing(connect(settings.database_path)) as db:
+        row = db.execute(
+            "SELECT value FROM app_settings WHERE key = 'dashboard_preferences'"
+        ).fetchone()
+    if row is None:
+        return dict(DEFAULT_DASHBOARD_PREFERENCES)
+    try:
+        preferences = DashboardPreferencesBody.model_validate_json(row["value"]).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Dashboard settings are invalid") from exc
+    if not valid_dashboard_preferences(preferences):
+        raise HTTPException(status_code=503, detail="Dashboard settings are invalid")
+    return preferences
+
+
 def file_metadata(name: str, entry_stat: os.stat_result) -> dict[str, Any]:
     mode = stat.S_IMODE(entry_stat.st_mode)
     return {
@@ -861,6 +911,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         audit_event(config, user, "password_changed")
         return {"ok": True, "message": "Password changed. Sign in again."}
 
+    @app.get("/api/dashboard/preferences")
+    async def get_dashboard_preferences(_: CurrentUser):
+        return read_dashboard_preferences(config)
+
+    @app.put("/api/owner/dashboard/preferences")
+    async def update_dashboard_preferences(
+        body: DashboardPreferencesBody, user: CurrentUser
+    ):
+        require_owner(user)
+        preferences = body.model_dump()
+        if not valid_dashboard_preferences(preferences):
+            raise HTTPException(status_code=422, detail="Choose supported dashboard options")
+        with closing(connect(config.database_path)) as db:
+            db.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('dashboard_preferences', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(preferences, separators=(",", ":")),),
+            )
+            db.commit()
+        audit_event(config, user, "dashboard_preferences_updated")
+        return preferences
+
     @app.get("/api/dashboard")
     async def dashboard(user: CurrentUser):
         filesystem_root = active_filesystem_root(config)
@@ -908,6 +980,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             metrics, app.state.host_metrics_sample = host_metrics(
                 config, app.state.host_metrics_sample
             )
+        disk = shutil.disk_usage(active_filesystem_root(config))
+        metrics["disk"] = {
+            "total": disk.total,
+            "used": disk.used,
+            "free": disk.free,
+        }
         return metrics
 
     @app.get("/api/owner/filesystem")
