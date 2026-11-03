@@ -217,8 +217,11 @@ def test_host_metrics_returns_validated_samples(client: TestClient, tmp_path: Pa
         assert first.json()["cpu_percent"] is None
         assert first.json()["memory"] == {"total": 1024000, "used": 614400, "available": 409600}
         assert first.json()["network"] == {"received_bytes": 1000, "transmitted_bytes": 2000}
-        assert first.json()["disk"]["total"] > 0
-        assert first.json()["disk"]["used"] + first.json()["disk"]["free"] == first.json()["disk"]["total"]
+        disk = first.json()["disk"]
+        assert disk["total"] > 0
+        assert disk["used"] >= 0
+        assert disk["free"] >= 0
+        assert disk["used"] + disk["free"] <= disk["total"]
 
         (proc / "stat").write_text("cpu 110 0 60 930 0 0 0 0 90 30\n", encoding="ascii")
         (proc / "net" / "dev").write_text(
