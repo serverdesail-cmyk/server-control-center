@@ -124,6 +124,7 @@ log "Refreshing SCC application files; existing environment and persistent data 
 git -C "${source_dir}" ls-files -z | tar -C "${source_dir}" --null -T - -cf - \
   | tar -C "${INSTALL_DIR}" -xf - || fail "Could not refresh the SCC application files."
 mv "${source_dir}/.git" "${INSTALL_DIR}/.git" || fail "Could not install the clean SCC Git metadata."
+chmod 0755 "${INSTALL_DIR}/management/scc" || fail "Could not make the SCC management command executable."
 git_backup_active=0
 
 [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || fail "The repaired installation is missing docker-compose.yml."
