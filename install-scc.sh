@@ -144,9 +144,9 @@ cat >"${WRAPPER}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 if [[ "${EUID}" -eq 0 ]]; then
-  exec /opt/server-control-center/management/scc "$@"
+  exec bash /opt/server-control-center/management/scc "$@"
 fi
-exec sudo /opt/server-control-center/management/scc "$@"
+exec sudo bash /opt/server-control-center/management/scc "$@"
 EOF
 chmod 0755 "${WRAPPER}"
 
