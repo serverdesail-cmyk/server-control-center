@@ -39,15 +39,17 @@
         </a>
         <div class="nav-caption">WORKSPACE</div>
         <nav class="main-nav" aria-label="Main navigation">
-          <button class="nav-item active" data-nav="dashboard"><span class="nav-icon">◫</span>Overview</button>
-          <button class="nav-item" data-nav="files"><span class="nav-icon">▤</span>Files</button>
-          <button class="nav-item owner-only" data-nav="access" hidden><span class="nav-icon">⌘</span>Access control</button>
-          <button class="nav-item" data-nav="appearance"><span class="nav-icon">◐</span>Appearance</button>
+          <button class="nav-item active" data-nav="dashboard" data-menu-key="dashboard" draggable="true"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="5" rx="2"/><rect x="13" y="10" width="8" height="11" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/></svg></span><span class="nav-label">Overview</span></button>
+          <button class="nav-item" data-nav="files" data-menu-key="files" draggable="true"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3z"/><path d="M3 10h18"/></svg></span><span class="nav-label">Files</span></button>
+          <button class="nav-item" data-nav="monitoring" data-menu-key="monitoring" draggable="true"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><span class="nav-label">Monitoring</span></button>
+          <button class="nav-item owner-only" data-nav="access" data-menu-key="access" draggable="true" hidden><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3 20 7v5c0 5-3.5 8-8 10-4.5-2-8-5-8-10V7z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="nav-label">Access</span></button>
+          <button class="nav-item" data-nav="logs" data-menu-key="logs" draggable="true"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="7" cy="5" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="19" r="1"/></svg></span><span class="nav-label">Logs</span></button>
+          <button class="nav-item" data-nav="appearance" data-menu-key="settings" draggable="true"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.7-1l-1.7.7-1.4-2.4L7 15a8 8 0 0 1 0-2l-1.4-1.1L7 9.5l1.7.7a8 8 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.7 1l1.7-.7 1.4 2.4L19.4 13a8 8 0 0 1 0 2z"/></svg></span><span class="nav-label">Settings</span></button>
         </nav>
         <div class="sidebar-bottom">
           <div class="connection"><span class="status-dot"></span><span>Protected session</span></div>
           <div class="profile">
-            <div class="avatar" id="avatar-letter">S</div>
+            <div class="avatar" id="avatar-shell"><span id="avatar-letter">S</span><img id="profile-avatar" alt="" hidden></div>
             <div class="profile-label"><strong id="profile-name">User</strong><small id="profile-role">USER</small></div>
             <button id="logout" class="icon-button" aria-label="Sign out" title="Sign out">↗</button>
           </div>
@@ -57,7 +59,7 @@
       <main class="main-area">
         <header class="topbar">
           <div><p class="eyebrow" id="section-eyebrow">SERVER OVERVIEW</p><h1 id="section-title">Overview</h1></div>
-          <div class="topbar-right"><span class="secure-label"><span class="status-dot"></span>Authenticated</span><button class="button subtle" data-nav="appearance">Customize</button></div>
+          <div class="topbar-right"><span class="secure-label"><span class="status-dot"></span>Authenticated</span></div>
         </header>
 
         <section id="dashboard-view" class="view">
@@ -66,24 +68,51 @@
             <button class="button primary" data-nav="files">Open file manager <span aria-hidden="true">→</span></button>
           </div>
           <div id="stats-grid" class="stats-grid">
-            <article class="stat-card"><span class="stat-icon">▤</span><span class="stat-label">Storage used</span><strong id="disk-used">—</strong><small id="disk-caption">Loading storage information</small><div class="meter"><i id="disk-meter"></i></div></article>
-            <article class="stat-card"><span class="stat-icon violet">◷</span><span class="stat-label">Service uptime</span><strong id="uptime">—</strong><small>SCC process uptime</small></article>
-            <article class="stat-card"><span class="stat-icon green">◉</span><span class="stat-label">Application</span><strong id="app-version">—</strong><small>Authenticated and online</small></article>
-            <article class="stat-card owner-only" hidden><span class="stat-icon amber">♙</span><span class="stat-label">Active sessions</span><strong id="sessions">—</strong><small>Current signed-in sessions</small></article>
+            <article class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 8h10M7 12h10M7 16h6"/></svg></span><span class="stat-label">Storage used</span><strong id="disk-used">—</strong><small id="disk-caption">Loading storage information</small><div class="meter"><i id="disk-meter"></i></div></article>
+            <article class="stat-card ring-stat"><span class="stat-icon violet"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><span class="stat-label">Server CPU</span><div class="stat-ring" id="cpu-ring" aria-label="CPU utilization"><strong id="cpu-ring-value">—</strong></div><strong id="cpu-value">—</strong><small id="cpu-caption">Waiting for sample</small><div class="meter"><i id="cpu-meter"></i></div></article>
+            <article class="stat-card ring-stat"><span class="stat-icon green"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></span><span class="stat-label">Server memory</span><div class="stat-ring green-ring" id="memory-ring" aria-label="Memory utilization"><strong id="memory-ring-value">—</strong></div><strong id="memory-used">—</strong><small id="memory-caption">Waiting for sample</small><div class="meter"><i id="memory-meter"></i></div></article>
+            <article class="stat-card"><span class="stat-icon amber"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><span class="stat-label">Server uptime</span><strong id="uptime">—</strong><small id="load-caption">Load average —</small></article>
+            <article class="stat-card"><span class="stat-icon green"><svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg></span><span class="stat-label">Application</span><strong id="app-version">—</strong><small>Authenticated and online</small></article>
+            <article class="stat-card owner-only" hidden><span class="stat-icon amber"><svg viewBox="0 0 24 24"><path d="M16 20v-1a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v1M10 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M18 8v6M21 11h-6"/></svg></span><span class="stat-label">Active sessions</span><strong id="sessions">—</strong><small>Current signed-in sessions</small></article>
           </div>
           <div class="dashboard-grid">
             <section class="panel activity-panel">
-              <div class="panel-heading"><div><h3>Recent activity</h3><p class="muted">Owner audit events</p></div><span class="pill">AUDIT</span></div>
+              <div class="panel-heading"><div><h3>Recent activity</h3><p class="muted">Server events and this browser</p></div><button class="text-button" data-nav="logs">Open logs →</button></div>
               <div id="activity-list" class="activity-list"><p class="empty-state">Activity will appear here.</p></div>
             </section>
             <section class="panel status-panel">
-              <div class="panel-heading"><div><h3>Access boundary</h3><p class="muted">Application access follows Linux permissions.</p></div><span class="status-dot"></span></div>
-              <div class="root-display"><span class="root-icon">/</span><div><small>EXPOSED FILESYSTEM ROOT</small><strong id="root-path">—</strong></div></div>
-              <p class="notice">SCC only sees the host directory mounted by your administrator. User grants do not change Linux ownership or permissions.</p>
-              <button class="button secondary" data-nav="access">Review folder grants</button>
+              <div class="panel-heading"><div><h3>Filesystem access</h3><p class="muted">Root_user access is unrestricted inside the active root.</p></div><span class="status-dot"></span></div>
+              <div class="root-display"><span class="root-icon"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3z"/></svg></span><div><small>ACTIVE ROOT</small><strong id="root-path">—</strong></div></div>
+              <p class="notice">Host mount boundary: <strong id="mount-root">—</strong>. Other accounts need folder grants; Linux permissions still apply.</p>
+              <button class="button secondary owner-only" data-nav="access" hidden>Review folder grants</button>
             </section>
           </div>
-          <div class="notice warning"><strong>First release scope:</strong> file management, owner/user administration, folder grants, and themes are implemented. Docker controls, a web terminal, sharing links, and host-wide monitoring are not exposed in this release.</div>
+          <section class="panel quick-actions"><div class="panel-heading"><div><h3>Quick actions</h3><p class="muted">Useful tools at a glance.</p></div></div><div class="quick-action-grid"><button class="quick-action" data-nav="monitoring"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><span><strong>Live monitoring</strong><small>CPU, memory and traffic</small></span></button><button class="quick-action" data-nav="logs"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/></svg></span><span><strong>Activity &amp; logs</strong><small>Server and this-browser history</small></span></button></div></section>
+        </section>
+
+        <section id="monitoring-view" class="view" hidden>
+          <div class="welcome-row"><div><h2>Server health</h2><p class="muted">Read-only host metrics refresh every few seconds while this page is open.</p></div><span id="metrics-status" class="pill">CONNECTING</span></div>
+          <div class="monitoring-grid">
+            <article class="panel metric-panel"><div class="panel-heading"><div><h3>Processor</h3><p class="muted">Total host CPU utilization</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span></div><div class="metric-ring" id="monitor-cpu-ring"><strong id="monitor-cpu-ring-value">—</strong></div><strong id="monitor-cpu" class="metric-value-detail">Sampling…</strong><div class="meter"><i id="monitor-cpu-meter"></i></div><small id="monitor-load" class="muted">Load average —</small></article>
+            <article class="panel metric-panel"><div class="panel-heading"><div><h3>Memory</h3><p class="muted">Host memory in use</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 8h6M9 12h6"/></svg></span></div><div class="metric-ring green-ring" id="monitor-memory-ring"><strong id="monitor-memory-ring-value">—</strong></div><strong id="monitor-memory" class="metric-value-detail">—</strong><div class="meter"><i id="monitor-memory-meter"></i></div><small id="monitor-memory-free" class="muted">Available —</small></article>
+            <article class="panel metric-panel"><div class="panel-heading"><div><h3>Network</h3><p class="muted">Combined non-loopback interfaces</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M4 12h16M12 4l8 8-8 8"/></svg></span></div><strong id="monitor-rx">↓ —</strong><small id="monitor-tx" class="muted">↑ —</small><small id="monitor-network-total" class="muted">Since host boot</small></article>
+            <article class="panel metric-panel"><div class="panel-heading"><div><h3>Host uptime</h3><p class="muted">Time since Linux boot</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span></div><strong id="monitor-uptime">—</strong><small id="metrics-updated" class="muted">Last sample —</small></article>
+          </div>
+          <section class="panel monitor-note"><h3>Monitoring scope</h3><p class="muted">SCC reads host CPU, memory, uptime, load and network counters through read-only Linux proc files. It does not inspect process command lines, control Docker, or change server settings.</p></section>
+        </section>
+
+        <section id="logs-view" class="view" hidden>
+          <div class="welcome-row"><div><h2>Activity &amp; logs</h2><p class="muted">Server audit events and private activity stored in this browser.</p></div><span class="pill online">UPDATING LIVE</span></div>
+          <section class="panel log-panel">
+            <div class="log-tabs" role="tablist" aria-label="Activity source">
+              <button class="button secondary active" data-log-filter="all" role="tab" aria-selected="true">All activity</button>
+              <button class="button secondary" data-log-filter="server" role="tab" aria-selected="false">Server</button>
+              <button class="button secondary" data-log-filter="browser" role="tab" aria-selected="false">This browser</button>
+              <button id="clear-browser-activity" class="button subtle" type="button">Clear browser history</button>
+            </div>
+            <p class="notice">Browser activity is stored only on this device. Server entries are the authenticated account's audit trail (Root_user can see all accounts). Container stdout/stderr is available on the host with <code>sudo scc logs</code>; SCC does not expose Docker controls to the browser.</p>
+            <div id="full-activity-list" class="activity-list"><p class="empty-state">Loading activity…</p></div>
+          </section>
         </section>
 
         <section id="files-view" class="view" hidden>
@@ -108,10 +137,19 @@
         </section>
 
         <section id="access-view" class="view" hidden>
-          <div class="welcome-row"><div><h2>Users &amp; folder grants</h2><p class="muted">Only the OWNER can assign application access.</p></div></div>
+          <div class="welcome-row"><div><h2>Accounts &amp; access</h2><p class="muted">Choose exactly what each account can do inside the active root.</p></div></div>
+          <section class="panel root-settings-panel">
+            <div class="panel-heading"><div><h3>Active filesystem root</h3><p class="muted">Choose which folder inside the host-mounted boundary the workspace manages.</p></div><span class="pill">ROOT_USER ONLY</span></div>
+            <form id="filesystem-root-form" class="root-form">
+              <label>Active directory<input id="filesystem-root-input" type="text" autocomplete="off" spellcheck="false" required></label>
+              <button id="filesystem-browse" class="button secondary" type="button">Browse folders</button>
+              <button id="filesystem-root-save" class="button primary" type="submit">Apply root</button>
+            </form>
+            <p class="notice">Mounted boundary: <strong id="filesystem-mount-label">—</strong>. Root_user can manage everything inside the active root. Users and admins are limited by their folder grants and Linux permissions. To expand the host mount itself, use server-side configuration; `/` is never allowed.</p>
+          </section>
           <div class="admin-grid">
             <section class="panel">
-              <div class="panel-heading"><div><h3>Accounts</h3><p class="muted">Exactly one OWNER account is allowed.</p></div></div>
+              <div class="panel-heading"><div><h3>People</h3><p class="muted">Only Root_user can create, disable, or reset accounts.</p></div></div>
               <form id="create-user-form" class="inline-form">
                 <input name="username" placeholder="Username" minlength="3" maxlength="32" required>
                 <input name="password" type="password" placeholder="Temporary password" minlength="12" maxlength="128" required>
@@ -124,14 +162,21 @@
               <div class="panel-heading"><div><h3>Folder grant</h3><p class="muted">The closest nested rule replaces its inherited parent rule.</p></div></div>
               <form id="grant-form" class="stack compact">
                 <label>Account<select id="grant-user" required></select></label>
-                <label>Folder path<input id="grant-path" value="/" required spellcheck="false"><small>Path is relative to the configured mount, e.g. /media.</small></label>
+                <label>Folder path<input id="grant-path" value="/" required spellcheck="false"><small>Path is relative to the active root, e.g. /media.</small></label>
+                <p id="grant-scope" class="grant-scope">Permissions apply only to the selected account and folder.</p>
+                <div class="permission-presets" aria-label="Permission presets">
+                  <button class="button secondary" type="button" data-permission-preset="read">Read only</button>
+                  <button class="button secondary" type="button" data-permission-preset="contribute">Contributor</button>
+                  <button class="button secondary" type="button" data-permission-preset="full">Full folder access</button>
+                  <button class="button secondary active" type="button" data-permission-preset="custom">Custom</button>
+                </div>
                 <div class="permission-options">
                   <label><input type="checkbox" value="browse"> Browse names</label>
                   <label><input type="checkbox" value="read"> Read / preview</label>
                   <label><input type="checkbox" value="download"> Download</label>
                   <label><input type="checkbox" value="upload"> Upload</label>
                   <label><input type="checkbox" value="create"> Create files / folders</label>
-                  <label><input type="checkbox" value="edit"> Edit files</label>
+                  <label><input type="checkbox" value="edit"> Edit text files</label>
                   <label><input type="checkbox" value="rename"> Rename</label>
                   <label><input type="checkbox" value="delete"> Delete</label>
                 </div>
@@ -144,7 +189,26 @@
         </section>
 
         <section id="appearance-view" class="view" hidden>
-          <div class="welcome-row"><div><h2>Make SCC yours</h2><p class="muted">Choose a preset or import a validated JSON theme.</p></div></div>
+          <div class="welcome-row"><div><h2>Workspace settings</h2><p class="muted">Personalize your menus, appearance and account.</p></div></div>
+          <section class="panel profile-settings-panel">
+            <div class="panel-heading"><div><h3>Your profile</h3><p class="muted">Your profile picture follows your account across devices.</p></div><span class="pill">ACCOUNT</span></div>
+            <div class="profile-customizer">
+              <div class="avatar profile-preview" id="profile-preview"><span id="profile-preview-letter">S</span><img id="profile-preview-image" alt="Profile picture preview" hidden></div>
+              <div class="profile-picture-actions">
+                <strong id="profile-customizer-name">Your account</strong>
+                <small class="muted">JPEG, PNG, or WebP · optimized in your browser · max 128 KiB</small>
+                <div class="toolbar-actions">
+                  <label class="button secondary">Choose picture<input id="profile-picture-input" type="file" accept="image/jpeg,image/png,image/webp" hidden></label>
+                  <button id="profile-picture-remove" class="button subtle" type="button">Remove picture</button>
+                </div>
+              </div>
+            </div>
+          </section>
+          <section class="panel menu-settings-panel">
+            <div class="panel-heading"><div><h3>Workspace menus</h3><p class="muted">Drag menu items to reorder. Choose which sections appear on this device.</p></div><span class="pill">THIS DEVICE</span></div>
+            <div id="menu-settings-list" class="menu-settings-list"></div>
+          </section>
+          <div class="welcome-row settings-subheading"><div><h2>Appearance</h2><p class="muted">Choose a preset or import a validated JSON theme.</p></div></div>
           <section class="panel theme-panel">
             <div class="theme-grid" id="theme-grid"></div>
             <div class="panel-divider"></div>
@@ -158,7 +222,7 @@
           </section>
         </section>
 
-        <footer class="footer"><span>SCC <span id="footer-version">0.1.0</span></span><span>Application permissions never replace Linux permissions.</span></footer>
+        <footer class="footer"><span>SCC <span id="footer-version">0.3.0</span></span><span>Application permissions never replace Linux permissions.</span></footer>
       </main>
     </div>
 
@@ -173,6 +237,14 @@
         <label>Temporary password<input id="reset-password-input" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
         <div class="dialog-actions"><button id="reset-password-cancel" class="button secondary" type="button">Cancel</button><button class="button primary" type="submit">Reset and revoke sessions</button></div>
       </form>
+    </dialog>
+    <dialog id="filesystem-dialog" class="filesystem-dialog">
+      <div class="dialog-head"><div><p class="eyebrow">ROOT_USER SETTINGS</p><h2>Select active filesystem root</h2></div><button id="filesystem-dialog-close" class="icon-button" aria-label="Close">×</button></div>
+      <p class="muted small-text">Browse only inside the fixed host mount. Selecting a folder makes it the workspace root.</p>
+      <div id="filesystem-picker-path" class="picker-path"></div>
+      <div id="filesystem-directory-list" class="filesystem-directory-list"></div>
+      <div id="filesystem-truncated" class="notice warning" hidden>Only the first 500 folders are shown. Type a path above to select another directory.</div>
+      <div class="dialog-actions"><button id="filesystem-picker-up" class="button secondary" type="button">Up one folder</button><button id="filesystem-picker-select" class="button primary" type="button">Use this folder</button></div>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </body>
