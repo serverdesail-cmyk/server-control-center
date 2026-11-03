@@ -10,7 +10,9 @@ Run this single command on the server:
 curl -fsSL https://raw.githubusercontent.com/serverdesail-cmyk/server-control-center/main/install-scc.sh | sudo bash
 ```
 
-The installer verifies the distribution, installs missing Arch packages with `pacman` (without a partial system upgrade), enables Docker when needed, fetches this public repository, creates a one-time setup token, builds the container, and checks the health endpoint.
+The installer verifies the distribution, installs missing Arch packages with `pacman` (without a partial system upgrade), enables Docker when needed, refreshes installed SCC files from a clean GitHub checkout, creates a one-time setup token when needed, rebuilds the container, and checks the health endpoint.
+
+Re-running this command is also the repair path: it replaces stale or damaged SCC source, Git metadata, and launchers while preserving `/opt/server-control-center/.env` and persistent data. For an older installation, `/etc/server-control-center/.env` is retained when no current configuration exists, and a detected legacy management command is redirected to the repaired installation. Unrelated files in the application directory and persistent data are not removed.
 
 Run the command from an unprivileged user account with `sudo`. SCC runs inside the container as that invoking user's numeric UID/GID, not as root. The installer does not add the user to the Docker group.
 

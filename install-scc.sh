@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly REPOSITORY_URL="https://github.com/serverdesail-cmyk/server-control-center.git"
 readonly INSTALL_DIR="/opt/server-control-center"
+readonly LEGACY_INSTALL_DIR="/etc/server-control-center"
 readonly STATE_DIR="/var/lib/server-control-center"
 readonly DATA_DIR="${STATE_DIR}/data"
 readonly WRAPPER="/usr/local/bin/scc"
@@ -55,6 +56,7 @@ fi
 command -v docker >/dev/null 2>&1 || fail "Docker CLI is still unavailable after package installation."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable. Install the Arch docker-compose package and retry."
 command -v git >/dev/null 2>&1 || fail "Git is required to fetch and update SCC."
+command -v tar >/dev/null 2>&1 || fail "tar is required to refresh the SCC installation."
 command -v curl >/dev/null 2>&1 || fail "curl is required for SCC health checks."
 command -v openssl >/dev/null 2>&1 || fail "OpenSSL is required to generate the one-time setup token."
 
@@ -65,30 +67,76 @@ if ! docker info >/dev/null 2>&1; then
 fi
 docker info >/dev/null 2>&1 || fail "Docker Engine is not responding. Check: sudo systemctl status docker.service"
 
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  log "Updating the existing SCC checkout."
-  git -C "${INSTALL_DIR}" pull --ff-only || fail "Could not update ${INSTALL_DIR}; resolve local changes before updating."
-elif [[ -e "${INSTALL_DIR}" ]]; then
-  if [[ -n "$(find "${INSTALL_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-    fail "${INSTALL_DIR} already exists and is not an SCC Git checkout; refusing to overwrite it."
+if [[ -L "${INSTALL_DIR}" || ( -e "${INSTALL_DIR}" && ! -d "${INSTALL_DIR}" ) ]]; then
+  fail "${INSTALL_DIR} is not a normal directory; refusing to replace it."
+fi
+if [[ -d "${INSTALL_DIR}" && ! -d "${INSTALL_DIR}/.git" \
+  && ! -f "${INSTALL_DIR}/.env" && ! -f "${INSTALL_DIR}/docker-compose.yml" \
+  && ! -f "${INSTALL_DIR}/management/scc" ]]; then
+  fail "${INSTALL_DIR} exists but does not look like an SCC installation; refusing to overwrite it."
+fi
+
+installer_tmp="$(mktemp -d)"
+previous_git="${installer_tmp}/previous.git"
+git_backup_active=0
+cleanup_installer() {
+  if [[ "${git_backup_active}" -eq 1 && -e "${previous_git}" && ! -e "${INSTALL_DIR}/.git" ]]; then
+    mv "${previous_git}" "${INSTALL_DIR}/.git" || log "WARNING: could not restore the previous Git metadata at ${INSTALL_DIR}/.git."
   fi
-  rmdir "${INSTALL_DIR}"
-fi
+  rm -rf -- "${installer_tmp}"
+}
+trap cleanup_installer EXIT
 
-if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
-  log "Downloading SCC source from GitHub."
-  git clone --depth 1 "${REPOSITORY_URL}" "${INSTALL_DIR}" || fail "Could not clone ${REPOSITORY_URL}."
-fi
+source_dir="${installer_tmp}/source"
+log "Downloading a clean SCC source checkout from GitHub."
+git clone --depth 1 "${REPOSITORY_URL}" "${source_dir}" || fail "Could not clone ${REPOSITORY_URL}."
 
-[[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || fail "The downloaded repository is missing docker-compose.yml."
-[[ -f "${INSTALL_DIR}/backend/Dockerfile" ]] || fail "The downloaded repository is missing the backend image definition."
-[[ -f "${INSTALL_DIR}/backend/app/main.py" ]] || fail "The downloaded repository is missing the SCC application."
-app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${INSTALL_DIR}/backend/app/main.py")"
-compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${INSTALL_DIR}/docker-compose.yml")"
+[[ -f "${source_dir}/docker-compose.yml" ]] || fail "The downloaded repository is missing docker-compose.yml."
+[[ -f "${source_dir}/backend/Dockerfile" ]] || fail "The downloaded repository is missing the backend image definition."
+[[ -f "${source_dir}/backend/app/main.py" ]] || fail "The downloaded repository is missing the SCC application."
+[[ -f "${source_dir}/management/scc" ]] || fail "The downloaded repository is missing the SCC management command."
+app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${source_dir}/backend/app/main.py")"
+compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${source_dir}/docker-compose.yml")"
 [[ -n "${app_version}" && "${app_version}" == "${compose_version}" ]] || fail "The downloaded application and Compose versions do not match."
 
-host_root="/srv"
+[[ -d "${INSTALL_DIR}" ]] || install -d -m 0755 "${INSTALL_DIR}"
 env_file="${INSTALL_DIR}/.env"
+legacy_env_file="${LEGACY_INSTALL_DIR}/.env"
+if [[ -L "${env_file}" ]]; then
+  fail "${env_file} is a symbolic link; refusing to overwrite or follow it."
+fi
+if [[ ! -e "${env_file}" && -f "${legacy_env_file}" ]]; then
+  [[ ! -L "${legacy_env_file}" ]] || fail "${legacy_env_file} is a symbolic link; refusing to follow it."
+  install -m 0600 "${legacy_env_file}" "${env_file}"
+  chmod 0600 "${legacy_env_file}"
+  log "Preserved configuration from the legacy ${LEGACY_INSTALL_DIR} installation."
+fi
+if [[ -e "${env_file}" && ! -f "${env_file}" ]]; then
+  fail "${env_file} is not a regular file; refusing to overwrite it."
+fi
+
+if [[ -d "${INSTALL_DIR}/.git" || -f "${INSTALL_DIR}/.git" || -L "${INSTALL_DIR}/.git" ]]; then
+  mv "${INSTALL_DIR}/.git" "${previous_git}" || fail "Could not safely replace the existing Git metadata."
+  git_backup_active=1
+fi
+
+log "Refreshing SCC application files; existing environment and persistent data are preserved."
+git -C "${source_dir}" ls-files -z | tar -C "${source_dir}" --null -T - -cf - \
+  | tar -C "${INSTALL_DIR}" -xf - || fail "Could not refresh the SCC application files."
+mv "${source_dir}/.git" "${INSTALL_DIR}/.git" || fail "Could not install the clean SCC Git metadata."
+git_backup_active=0
+
+[[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || fail "The repaired installation is missing docker-compose.yml."
+[[ -f "${INSTALL_DIR}/backend/Dockerfile" ]] || fail "The repaired installation is missing the backend image definition."
+[[ -f "${INSTALL_DIR}/backend/app/main.py" ]] || fail "The repaired installation is missing the SCC application."
+[[ -x "${INSTALL_DIR}/management/scc" ]] || fail "The repaired management command is not executable."
+app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${INSTALL_DIR}/backend/app/main.py")"
+compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${INSTALL_DIR}/docker-compose.yml")"
+[[ -n "${app_version}" && "${app_version}" == "${compose_version}" ]] || fail "The repaired application and Compose versions do not match."
+bash -n "${INSTALL_DIR}/install-scc.sh" || fail "The repaired installer failed Bash syntax validation."
+bash -n "${INSTALL_DIR}/management/scc" || fail "The repaired management command failed Bash syntax validation."
+
+host_root="/srv"
 if [[ -f "${env_file}" ]]; then
   configured_root="$(sed -n 's/^SCC_HOST_ROOT=//p' "${env_file}" | tail -n 1)"
   [[ -n "${configured_root}" ]] && host_root="${configured_root}"
@@ -153,6 +201,26 @@ fi
 exec sudo bash /opt/server-control-center/management/scc "$@"
 EOF
 chmod 0755 "${WRAPPER}"
+
+legacy_management="${LEGACY_INSTALL_DIR}/management/scc"
+if [[ -f "${legacy_management}" ]] \
+  && grep -Eq 'server-control-center|management/scc' "${legacy_management}"; then
+  cat >"${installer_tmp}/legacy-scc" <<'EOF'
+#!/usr/bin/env bash
+exec bash /opt/server-control-center/management/scc "$@"
+EOF
+  chmod 0755 "${installer_tmp}/legacy-scc"
+  mv -f -- "${installer_tmp}/legacy-scc" "${legacy_management}"
+  log "Repaired the legacy management command at ${legacy_management}."
+fi
+
+for command_path in /usr/bin/scc /bin/scc; do
+  if [[ -f "${command_path}" && ! -L "${command_path}" ]] \
+    && grep -Eq '/etc/server-control-center/management/scc|/opt/server-control-center/management/scc' "${command_path}"; then
+    install -m 0755 "${WRAPPER}" "${command_path}"
+    log "Repaired the existing SCC launcher at ${command_path}."
+  fi
+done
 
 log "Building SCC ${app_version} and applying any persistent-data migrations."
 docker compose --project-name scc --project-directory "${INSTALL_DIR}" --env-file "${env_file}" -f "${INSTALL_DIR}/docker-compose.yml" up --build --detach --force-recreate
