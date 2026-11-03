@@ -43,7 +43,7 @@ case "${1:-}" in
     compose stop
     ;;
   restart)
-    compose restart
+    compose up --detach --force-recreate
     ;;
   update)
     git -C "${APP_DIR}" pull --ff-only
