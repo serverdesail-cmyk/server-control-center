@@ -17,7 +17,7 @@ usage() {
     "  update      Fetch the latest main branch and rebuild SCC" \
     "  logs        Follow service logs" \
     "  status      Show service status" \
-    "  setup-token Show the one-time OWNER setup token before first setup" \
+    "  setup-token Show the one-time Root_user setup token before first setup" \
     "  uninstall   Remove SCC after explicit confirmation"
 }
 
@@ -35,6 +35,30 @@ compose() {
     --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
 }
 
+verify_updated_version() {
+  local expected_version compose_version actual_version response
+  expected_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${APP_DIR}/backend/app/main.py")"
+  [[ -n "${expected_version}" ]] || { printf 'Could not read the expected SCC version from the updated source.\n' >&2; return 1; }
+  compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${COMPOSE_FILE}")"
+  [[ "${compose_version}" == "${expected_version}" ]] || {
+    printf 'SCC source version %s does not match Compose image version %s.\n' "${expected_version}" "${compose_version:-unavailable}" >&2
+    return 1
+  }
+  for _ in $(seq 1 60); do
+    if response="$(curl --silent --show-error --fail "${HEALTH_URL}/health" 2>/dev/null)"; then
+      actual_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"${response}")"
+      if [[ "${actual_version}" == "${expected_version}" ]]; then
+        printf 'SCC %s is healthy. Existing accounts, settings, grants, and audit history were retained.\n' "${actual_version}"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  printf 'SCC did not report expected version %s after the update.\n' "${expected_version}" >&2
+  compose logs --tail 80 >&2
+  return 1
+}
+
 case "${1:-}" in
   start)
     compose up --detach
@@ -46,8 +70,10 @@ case "${1:-}" in
     compose up --detach --force-recreate
     ;;
   update)
+    printf 'Fetching SCC updates (local edits are preserved; non-fast-forward changes are refused).\n'
     git -C "${APP_DIR}" pull --ff-only
-    compose up --build --detach
+    compose up --build --detach --force-recreate
+    verify_updated_version
     ;;
   logs)
     compose logs --tail 200 --follow
@@ -64,12 +90,12 @@ case "${1:-}" in
     if grep -Eq '"owner_exists"[[:space:]]*:[[:space:]]*true' <<<"${status}"; then
       sed -i '/^SCC_SETUP_TOKEN=/d' "${ENV_FILE}"
       chmod 0600 "${ENV_FILE}"
-      printf 'OWNER setup is already complete; the unused setup token was removed.\n'
+      printf 'Root_user setup is already complete; the unused setup token was removed.\n'
       exit 0
     fi
     token="$(sed -n 's/^SCC_SETUP_TOKEN=//p' "${ENV_FILE}" | tail -n 1)"
     [[ -n "${token}" ]] || { printf 'Setup token is missing. Reinstall or inspect %s.\n' "${ENV_FILE}" >&2; exit 1; }
-    printf 'One-time SCC OWNER setup token:\n%s\n' "${token}"
+    printf 'One-time SCC Root_user setup token:\n%s\n' "${token}"
     ;;
   uninstall)
     read -r -p "Remove SCC application files and stop the service? [y/N] " answer
