@@ -82,6 +82,10 @@ fi
 
 [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || fail "The downloaded repository is missing docker-compose.yml."
 [[ -f "${INSTALL_DIR}/backend/Dockerfile" ]] || fail "The downloaded repository is missing the backend image definition."
+[[ -f "${INSTALL_DIR}/backend/app/main.py" ]] || fail "The downloaded repository is missing the SCC application."
+app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${INSTALL_DIR}/backend/app/main.py")"
+compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${INSTALL_DIR}/docker-compose.yml")"
+[[ -n "${app_version}" && "${app_version}" == "${compose_version}" ]] || fail "The downloaded application and Compose versions do not match."
 
 host_root="/srv"
 env_file="${INSTALL_DIR}/.env"
@@ -150,24 +154,28 @@ exec sudo bash /opt/server-control-center/management/scc "$@"
 EOF
 chmod 0755 "${WRAPPER}"
 
-log "Building SCC and starting the service."
-docker compose --project-name scc --project-directory "${INSTALL_DIR}" --env-file "${env_file}" -f "${INSTALL_DIR}/docker-compose.yml" up --build --detach
+log "Building SCC ${app_version} and applying any persistent-data migrations."
+docker compose --project-name scc --project-directory "${INSTALL_DIR}" --env-file "${env_file}" -f "${INSTALL_DIR}/docker-compose.yml" up --build --detach --force-recreate
 
 health_url="http://127.0.0.1:$(sed -n 's/^SCC_PORT=//p' "${env_file}" | tail -n 1)/api/health"
 ready=0
+reported_version=""
 for _ in $(seq 1 60); do
-  if curl --silent --show-error --fail "${health_url}" >/dev/null 2>&1; then
-    ready=1
-    break
+  if health_response="$(curl --silent --show-error --fail "${health_url}" 2>/dev/null)"; then
+    reported_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"${health_response}")"
+    if [[ "${reported_version}" == "${app_version}" ]]; then
+      ready=1
+      break
+    fi
   fi
   sleep 2
 done
 if [[ "${ready}" -ne 1 ]]; then
   docker compose --project-name scc --project-directory "${INSTALL_DIR}" --env-file "${env_file}" -f "${INSTALL_DIR}/docker-compose.yml" logs --tail 80 >&2
-  fail "SCC did not become healthy. Check: sudo scc logs"
+  fail "SCC did not report expected version ${app_version} (reported: ${reported_version:-unavailable}). Check: sudo scc logs"
 fi
 
-log "Installation is healthy."
+log "SCC ${reported_version} is healthy; existing account and audit data were retained."
 log "Open http://127.0.0.1:8787 on the server, or run: ngrok http 8787"
 log "Retrieve the one-time owner setup token securely with: sudo scc setup-token"
 log "Management: scc start|stop|restart|update|logs|status|uninstall"

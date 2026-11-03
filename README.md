@@ -1,6 +1,6 @@
 # SCC — Server Control Center
 
-SCC is a self-hosted web workspace for securely managing an explicitly mounted part of an Arch-based Linux server. The first release focuses on authenticated file operations, owner-managed accounts and folder grants, and a responsive interface.
+SCC is a self-hosted web workspace for securely managing an explicitly mounted part of an Arch-based Linux server. It provides authenticated file operations, Root_user-managed accounts and folder grants, live host monitoring, and a customizable responsive workspace.
 
 ## Install on Arch, CachyOS, or another Arch-based distribution
 
@@ -14,7 +14,7 @@ The installer verifies the distribution, installs missing Arch packages with `pa
 
 Run the command from an unprivileged user account with `sudo`. SCC runs inside the container as that invoking user's numeric UID/GID, not as root. The installer does not add the user to the Docker group.
 
-## First-owner setup
+## Root_user setup
 
 On the server, open `http://localhost:8787` and retrieve the one-time token in a terminal:
 
@@ -22,7 +22,7 @@ On the server, open `http://localhost:8787` and retrieve the one-time token in a
 sudo scc setup-token
 ```
 
-Enter that token, a username, and a password of at least 12 characters in the setup screen. Setup is single-use: the database enforces one OWNER account. After setup, run `sudo scc setup-token` again to remove the now-unused token from the Compose environment.
+Enter that token, a username, and a password of at least 12 characters in the setup screen to create the Root_user account. Setup is single-use: the database enforces one privileged account (stored internally as `owner`). After setup, run `sudo scc setup-token` again to remove the now-unused token from the Compose environment.
 
 Keep the owner credentials private. The setup token is not printed during installation or written to installer logs.
 
@@ -46,26 +46,31 @@ Configure the host firewall before doing this. `SCC_COOKIE_SECURE=true` is the r
 
 ## Filesystem access boundary
 
-By default, the only host directory mounted into the application is `/srv`. The entire host filesystem and Docker socket are not mounted. The OWNER can grant application permissions beneath this configured root; the container's numeric user must also have the relevant Linux filesystem permissions. SCC does not change host ownership or mode bits.
+By default, the only host directory mounted into the application is `/srv`. The entire host filesystem and Docker socket are not mounted. Root_user can choose an active workspace directory from the Access control page, anywhere inside this configured mount. Root_user can manage everything inside that active root without application-level grants; the container's numeric user must still have the relevant Linux filesystem permissions. USER and ADMIN accounts are constrained by grants beneath the active root. SCC does not change host ownership or mode bits.
 
-To use a different dedicated host directory, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, then run `sudo scc restart` to recreate the container with the new mount. The host root must not contain a colon. Only that one directory is mounted into the container.
+The active root can be changed in the owner panel without restarting. Changing it remaps grants that still point inside the new root and removes grants that would no longer refer to the same physical paths. The owner can browse and apply only directories inside the configured mount.
+
+To use a different dedicated host directory or expand the available host boundary, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, then run `sudo scc restart` to recreate the container with the new mount. The host root must not contain a colon. Only that one directory is mounted into the container.
 
 SCC uses descriptor-relative Linux filesystem operations, refuses symbolic-link traversal, rejects `..` path components, and does not permit overwriting an existing file during upload or rename. Upload data is streamed in bounded chunks (1 GiB maximum by default); downloads support HTTP byte ranges. Text editing is limited to UTF-8 files up to 1 MiB.
 
 ## Available features
 
-- One-time OWNER bootstrap, Argon2id password hashing, opaque random sessions stored server-side, session expiry and revocation.
+- One-time Root_user bootstrap, Argon2id password hashing, opaque random sessions stored server-side, session expiry and revocation.
 - HttpOnly, SameSite cookies; Secure cookies by default; CSRF and same-host Origin checks on browser mutations; login throttling; security headers.
-- OWNER-managed USER and ADMIN accounts, account disable/delete, password reset, and session revocation.
+- Root_user-managed USER and ADMIN accounts, account disable/delete, password reset, and session revocation.
 - Per-user nested folder grants for browsing, reading, downloading, uploading, creating, editing, renaming, and deleting. A deeper grant replaces the inherited rule for that folder.
 - File/folder listing, previews and bounded editing, create, upload with progress/cancel, range downloads, rename and delete.
-- Storage information and a limited owner-only activity feed.
-- Six built-in color themes, safe JSON color-theme import/export, and local appearance preferences.
+- Root_user-selectable active filesystem root inside the fixed host mount, with safe grant remapping and an in-app directory picker.
+- Live host CPU, memory, uptime, load-average, and network-counter monitoring. Selected `/proc` files are mounted read-only; SCC does not inspect process command lines or control the host.
+- Separate Logs view with live server audit entries and per-account browser activity kept in that browser's local storage. Regular accounts see only their own server audit records; Root_user can see all. Raw container output remains host-only through `sudo scc logs`.
+- Per-account profile pictures optimized in the browser and stored with the server-side account profile.
+- Six built-in color themes, safe JSON color-theme import/export, and per-device menu visibility and ordering. Menus can be reordered by drag-and-drop or accessible move controls.
 - Docker Compose deployment with a read-only container root, dropped Linux capabilities, resource limits, `no-new-privileges`, and an unprivileged container process.
 
 ## Release boundaries
 
-This initial release does not expose Docker resource controls, a browser terminal, public sharing links, host-wide filesystem browsing, a privileged host agent, resumable/pause-and-resume transfers, syntax highlighting, recursive search, or complete CPU/memory/network monitoring. Those functions are intentionally not represented as working features or given privileged access. The installed version is a secure, useful file-management foundation, not the full feature set in the SCC specification.
+SCC does not expose Docker resource controls, a browser terminal, public sharing links, host-wide filesystem browsing, a privileged host agent, resumable/pause-and-resume transfers, syntax highlighting, or recursive search. The configured host mount remains the hard boundary; the web application cannot access `/` or bypass Linux permissions.
 
 ## Management
 
@@ -79,6 +84,8 @@ sudo scc status
 sudo scc setup-token
 sudo scc uninstall
 ```
+
+`sudo scc update` fetches the latest code, rebuilds/recreates the container, then verifies that the health endpoint reports the version in the updated source. The installer performs the same version check. Account, profile, grant, session, and audit data remain in `/var/lib/server-control-center/data`; database initialization adds new columns/settings without replacing that database. Keep a backup of this directory before updates. If the configured host mount changes, an active root that is no longer within it safely resets to the new mount and stale grants are cleared.
 
 Uninstall asks before stopping/removing application files, then separately asks whether to delete persistent application data under `/var/lib/server-control-center/`. Answer no to retain that data.
 

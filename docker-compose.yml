@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: scc-server-control-center:0.1.0
+    image: scc-server-control-center:0.3.0
     container_name: server-control-center
     init: true
     restart: unless-stopped
@@ -19,6 +19,11 @@ services:
     volumes:
       - "${SCC_DATA_PATH:-/var/lib/server-control-center/data}:/data:rw"
       - "${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}:${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}:rw"
+      - /proc/stat:/host/proc/stat:ro
+      - /proc/meminfo:/host/proc/meminfo:ro
+      - /proc/uptime:/host/proc/uptime:ro
+      - /proc/loadavg:/host/proc/loadavg:ro
+      - /proc/net/dev:/host/proc/net/dev:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
