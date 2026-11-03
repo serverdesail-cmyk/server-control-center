@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly APP_DIR="/opt/server-control-center"
+readonly ENV_FILE="${APP_DIR}/.env"
+readonly COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+readonly PROJECT_NAME="scc"
+readonly DATA_DIR="/var/lib/server-control-center"
+readonly HEALTH_URL="http://127.0.0.1:$(sed -n 's/^SCC_PORT=//p' "${ENV_FILE}" 2>/dev/null | tail -n 1)/api"
+
+usage() {
+  printf '%s\n' \
+    "Usage: scc {start|stop|restart|update|logs|status|setup-token|uninstall}" \
+    "  start       Start SCC" \
+    "  stop        Stop SCC without deleting stored data" \
+    "  restart     Restart SCC" \
+    "  update      Fetch the latest main branch and rebuild SCC" \
+    "  logs        Follow service logs" \
+    "  status      Show service status" \
+    "  setup-token Show the one-time OWNER setup token before first setup" \
+    "  uninstall   Remove SCC after explicit confirmation"
+}
+
+if [[ "${EUID}" -ne 0 ]]; then
+  printf 'Run this command through sudo.\n' >&2
+  exit 1
+fi
+if [[ ! -f "${ENV_FILE}" || ! -f "${COMPOSE_FILE}" ]]; then
+  printf 'SCC is not installed at %s.\n' "${APP_DIR}" >&2
+  exit 1
+fi
+
+compose() {
+  docker compose --project-name "${PROJECT_NAME}" --project-directory "${APP_DIR}" \
+    --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+}
+
+case "${1:-}" in
+  start)
+    compose up --detach
+    ;;
+  stop)
+    compose stop
+    ;;
+  restart)
+    compose restart
+    ;;
+  update)
+    git -C "${APP_DIR}" pull --ff-only
+    compose up --build --detach
+    ;;
+  logs)
+    compose logs --tail 200 --follow
+    ;;
+  status)
+    compose ps
+    ;;
+  setup-token)
+    if [[ ! -t 1 ]]; then
+      printf 'Refusing to print the setup token when stdout is not a terminal.\n' >&2
+      exit 1
+    fi
+    status="$(curl --silent --show-error --fail "${HEALTH_URL}/setup/status")"
+    if grep -Eq '"owner_exists"[[:space:]]*:[[:space:]]*true' <<<"${status}"; then
+      sed -i '/^SCC_SETUP_TOKEN=/d' "${ENV_FILE}"
+      chmod 0600 "${ENV_FILE}"
+      printf 'OWNER setup is already complete; the unused setup token was removed.\n'
+      exit 0
+    fi
+    token="$(sed -n 's/^SCC_SETUP_TOKEN=//p' "${ENV_FILE}" | tail -n 1)"
+    [[ -n "${token}" ]] || { printf 'Setup token is missing. Reinstall or inspect %s.\n' "${ENV_FILE}" >&2; exit 1; }
+    printf 'One-time SCC OWNER setup token:\n%s\n' "${token}"
+    ;;
+  uninstall)
+    read -r -p "Remove SCC application files and stop the service? [y/N] " answer
+    [[ "${answer}" == [yY] ]] || { printf 'Uninstall canceled.\n'; exit 0; }
+    compose down --remove-orphans
+    rm -f /usr/local/bin/scc
+    rm -rf -- "${APP_DIR}"
+    printf 'SCC application files removed. Persistent data remains at %s.\n' "${DATA_DIR}"
+    read -r -p "Also permanently delete persistent SCC data? [y/N] " delete_data
+    if [[ "${delete_data}" == [yY] ]]; then
+      rm -rf -- "${DATA_DIR}"
+      printf 'Persistent data removed.\n'
+    else
+      printf 'Persistent data retained at %s.\n' "${DATA_DIR}"
+    fi
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
