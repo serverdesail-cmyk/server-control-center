@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>SCC | Server Control Center</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <main id="auth-view" class="auth-wrap" hidden>
+      <section class="auth-card">
+        <div class="brand-mark">S</div>
+        <p class="eyebrow">SERVER CONTROL CENTER</p>
+        <h1 id="auth-title">Welcome back</h1>
+        <p id="auth-description" class="muted">Sign in to your server workspace.</p>
+        <form id="auth-form" class="stack">
+          <label id="setup-token-label" hidden>One-time setup token
+            <input id="setup-token" autocomplete="one-time-code" spellcheck="false">
+          </label>
+          <label>Username
+            <input id="auth-username" autocomplete="username" minlength="3" maxlength="32" required>
+          </label>
+          <label>Password
+            <input id="auth-password" type="password" autocomplete="current-password" minlength="12" maxlength="128" required>
+          </label>
+          <button id="auth-submit" class="button primary" type="submit">Sign in</button>
+        </form>
+        <p id="auth-hint" class="fine muted"></p>
+      </section>
+    </main>
+
+    <div id="app-shell" class="app-shell" hidden>
+      <aside class="sidebar">
+        <a class="brand" href="#" data-nav="dashboard">
+          <span class="brand-mark small">S</span>
+          <span><strong>SCC</strong><small>Server Control Center</small></span>
+        </a>
+        <div class="nav-caption">WORKSPACE</div>
+        <nav class="main-nav" aria-label="Main navigation">
+          <button class="nav-item active" data-nav="dashboard"><span class="nav-icon">◫</span>Overview</button>
+          <button class="nav-item" data-nav="files"><span class="nav-icon">▤</span>Files</button>
+          <button class="nav-item owner-only" data-nav="access" hidden><span class="nav-icon">⌘</span>Access control</button>
+          <button class="nav-item" data-nav="appearance"><span class="nav-icon">◐</span>Appearance</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="connection"><span class="status-dot"></span><span>Protected session</span></div>
+          <div class="profile">
+            <div class="avatar" id="avatar-letter">S</div>
+            <div class="profile-label"><strong id="profile-name">User</strong><small id="profile-role">USER</small></div>
+            <button id="logout" class="icon-button" aria-label="Sign out" title="Sign out">↗</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-area">
+        <header class="topbar">
+          <div><p class="eyebrow" id="section-eyebrow">SERVER OVERVIEW</p><h1 id="section-title">Overview</h1></div>
+          <div class="topbar-right"><span class="secure-label"><span class="status-dot"></span>Authenticated</span><button class="button subtle" data-nav="appearance">Customize</button></div>
+        </header>
+
+        <section id="dashboard-view" class="view">
+          <div class="welcome-row">
+            <div><h2>Your server at a glance</h2><p class="muted">A secure workspace for the paths you choose to share.</p></div>
+            <button class="button primary" data-nav="files">Open file manager <span aria-hidden="true">→</span></button>
+          </div>
+          <div id="stats-grid" class="stats-grid">
+            <article class="stat-card"><span class="stat-icon">▤</span><span class="stat-label">Storage used</span><strong id="disk-used">—</strong><small id="disk-caption">Loading storage information</small><div class="meter"><i id="disk-meter"></i></div></article>
+            <article class="stat-card"><span class="stat-icon violet">◷</span><span class="stat-label">Service uptime</span><strong id="uptime">—</strong><small>SCC process uptime</small></article>
+            <article class="stat-card"><span class="stat-icon green">◉</span><span class="stat-label">Application</span><strong id="app-version">—</strong><small>Authenticated and online</small></article>
+            <article class="stat-card owner-only" hidden><span class="stat-icon amber">♙</span><span class="stat-label">Active sessions</span><strong id="sessions">—</strong><small>Current signed-in sessions</small></article>
+          </div>
+          <div class="dashboard-grid">
+            <section class="panel activity-panel">
+              <div class="panel-heading"><div><h3>Recent activity</h3><p class="muted">Owner audit events</p></div><span class="pill">AUDIT</span></div>
+              <div id="activity-list" class="activity-list"><p class="empty-state">Activity will appear here.</p></div>
+            </section>
+            <section class="panel status-panel">
+              <div class="panel-heading"><div><h3>Access boundary</h3><p class="muted">Application access follows Linux permissions.</p></div><span class="status-dot"></span></div>
+              <div class="root-display"><span class="root-icon">/</span><div><small>EXPOSED FILESYSTEM ROOT</small><strong id="root-path">—</strong></div></div>
+              <p class="notice">SCC only sees the host directory mounted by your administrator. User grants do not change Linux ownership or permissions.</p>
+              <button class="button secondary" data-nav="access">Review folder grants</button>
+            </section>
+          </div>
+          <div class="notice warning"><strong>First release scope:</strong> file management, owner/user administration, folder grants, and themes are implemented. Docker controls, a web terminal, sharing links, and host-wide monitoring are not exposed in this release.</div>
+        </section>
+
+        <section id="files-view" class="view" hidden>
+          <div class="files-toolbar">
+            <div id="breadcrumbs" class="breadcrumbs" aria-label="Folder path"></div>
+            <div class="toolbar-actions">
+              <button id="new-folder" class="button secondary">＋ Folder</button>
+              <button id="new-file" class="button secondary">＋ File</button>
+              <label class="button primary upload-button">↑ Upload<input id="upload-input" type="file" multiple hidden></label>
+            </div>
+          </div>
+          <div id="drop-zone" class="drop-zone">
+            <span>Drop files here to upload</span>
+            <div class="files-subtoolbar">
+              <label class="search-box"><span>⌕</span><input id="file-filter" type="search" placeholder="Filter this folder"></label>
+              <span id="file-count" class="muted small-text"></span>
+              <div class="view-switch"><button id="list-view" class="active" aria-label="List view">☷</button><button id="grid-view" aria-label="Grid view">▦</button></div>
+            </div>
+            <div id="upload-progress" class="upload-progress" hidden><span id="upload-label">Uploading</span><progress id="upload-meter" max="100" value="0"></progress><button id="cancel-upload" class="text-button">Cancel</button></div>
+            <div id="file-list" class="file-list"></div>
+          </div>
+        </section>
+
+        <section id="access-view" class="view" hidden>
+          <div class="welcome-row"><div><h2>Users &amp; folder grants</h2><p class="muted">Only the OWNER can assign application access.</p></div></div>
+          <div class="admin-grid">
+            <section class="panel">
+              <div class="panel-heading"><div><h3>Accounts</h3><p class="muted">Exactly one OWNER account is allowed.</p></div></div>
+              <form id="create-user-form" class="inline-form">
+                <input name="username" placeholder="Username" minlength="3" maxlength="32" required>
+                <input name="password" type="password" placeholder="Temporary password" minlength="12" maxlength="128" required>
+                <select name="role" aria-label="Account role"><option value="user">User</option><option value="admin">Admin</option></select>
+                <button class="button primary" type="submit">Create account</button>
+              </form>
+              <div id="user-list" class="table-wrap"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-heading"><div><h3>Folder grant</h3><p class="muted">The closest nested rule replaces its inherited parent rule.</p></div></div>
+              <form id="grant-form" class="stack compact">
+                <label>Account<select id="grant-user" required></select></label>
+                <label>Folder path<input id="grant-path" value="/" required spellcheck="false"><small>Path is relative to the configured mount, e.g. /media.</small></label>
+                <div class="permission-options">
+                  <label><input type="checkbox" value="browse"> Browse names</label>
+                  <label><input type="checkbox" value="read"> Read / preview</label>
+                  <label><input type="checkbox" value="download"> Download</label>
+                  <label><input type="checkbox" value="upload"> Upload</label>
+                  <label><input type="checkbox" value="create"> Create files / folders</label>
+                  <label><input type="checkbox" value="edit"> Edit files</label>
+                  <label><input type="checkbox" value="rename"> Rename</label>
+                  <label><input type="checkbox" value="delete"> Delete</label>
+                </div>
+                <label class="check-line"><input id="grant-inherit" type="checkbox" checked> Inherit into subfolders</label>
+                <button class="button primary" type="submit">Save grant</button>
+              </form>
+              <div id="grant-list" class="grant-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="appearance-view" class="view" hidden>
+          <div class="welcome-row"><div><h2>Make SCC yours</h2><p class="muted">Choose a preset or import a validated JSON theme.</p></div></div>
+          <section class="panel theme-panel">
+            <div class="theme-grid" id="theme-grid"></div>
+            <div class="panel-divider"></div>
+            <div class="theme-actions"><div><h3>Custom design file</h3><p class="muted">Theme JSON is validated and applied locally; imports cannot run code.</p></div><div class="toolbar-actions"><label class="button secondary">Import JSON<input id="theme-import" type="file" accept="application/json,.json" hidden></label><button id="theme-export" class="button secondary">Export current theme</button></div></div>
+            <div class="panel-divider"></div>
+            <form id="password-form" class="stack compact password-form">
+              <div><h3>Change your password</h3><p class="muted">Changing your password revokes all current sessions.</p></div>
+              <label>New password<input id="new-password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
+              <button class="button secondary" type="submit">Update password</button>
+            </form>
+          </section>
+        </section>
+
+        <footer class="footer"><span>SCC <span id="footer-version">0.1.0</span></span><span>Application permissions never replace Linux permissions.</span></footer>
+      </main>
+    </div>
+
+    <dialog id="editor-dialog" class="editor-dialog">
+      <form method="dialog" class="dialog-head"><div><p class="eyebrow">FILE EDITOR</p><h2 id="editor-title">File</h2></div><button class="icon-button" aria-label="Close">×</button></form>
+      <textarea id="editor-content" spellcheck="false"></textarea>
+      <div class="dialog-actions"><span id="editor-mode" class="muted small-text"></span><button id="editor-save" class="button primary">Save changes</button></div>
+    </dialog>
+    <dialog id="reset-password-dialog" class="reset-dialog">
+      <form id="reset-password-form" class="stack">
+        <div><p class="eyebrow">ACCOUNT SECURITY</p><h2 id="reset-password-title">Reset password</h2></div>
+        <label>Temporary password<input id="reset-password-input" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
+        <div class="dialog-actions"><button id="reset-password-cancel" class="button secondary" type="button">Cancel</button><button class="button primary" type="submit">Reset and revoke sessions</button></div>
+      </form>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
