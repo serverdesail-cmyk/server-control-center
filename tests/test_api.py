@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import sqlite3
+import base64
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,7 @@ def bootstrap(client: TestClient) -> dict[str, str]:
         },
     )
     assert response.status_code == 200, response.text
+    assert response.json()["id"] > 0
     return csrf(client)
 
 
@@ -64,6 +67,7 @@ def login(client: TestClient, username: str, password: str) -> dict[str, str]:
         json={"username": username, "password": password},
     )
     assert response.status_code == 200, response.text
+    assert response.json()["id"] > 0
     return csrf(client)
 
 
@@ -118,6 +122,179 @@ def test_setup_is_single_owner_and_protected_apis_require_login(client: TestClie
     assert second.status_code == 409
     assert client.get("/api/users").status_code == 200
     assert headers["X-CSRF-Token"] == client.cookies.get("scc_csrf")
+
+
+def test_existing_database_is_migrated_without_losing_owner_or_audit(client: TestClient) -> None:
+    bootstrap(client)
+    database_path = client.app.state.settings.database_path
+    with sqlite3.connect(database_path) as db:
+        audit_count = db.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
+        db.execute("DROP TABLE app_settings")
+        db.execute("ALTER TABLE users DROP COLUMN avatar")
+
+    with TestClient(create_app(client.app.state.settings)) as migrated:
+        migrated.cookies.update(client.cookies)
+        status = migrated.get("/api/setup/status")
+        assert status.json()["owner_exists"] is True
+        assert migrated.get("/api/auth/me").json()["username"] == "rootowner"
+        assert migrated.get("/api/activity").status_code == 200
+        with sqlite3.connect(database_path) as db:
+            assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+            assert db.execute("SELECT COUNT(*) FROM audit").fetchone()[0] == audit_count
+            assert "avatar" in {
+                row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()
+            }
+            assert db.execute("SELECT value FROM app_settings WHERE key = 'active_filesystem_root'").fetchone()[0] == str(
+                client.app.state.settings.filesystem_root.resolve()
+            )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_owner_filesystem_root_change_remaps_grants_and_stays_inside_mount(client: TestClient) -> None:
+    owner_headers = bootstrap(client)
+    user_id = create_user(client, owner_headers)
+    grant(client, owner_headers, user_id, "/team", ["browse", "read"])
+    grant(client, owner_headers, user_id, "/private", ["browse"])
+
+    filesystem = client.get("/api/owner/filesystem")
+    assert filesystem.status_code == 200
+    assert filesystem.json()["active_root"] == str(client.app.state.settings.filesystem_root)
+    assert {item["name"] for item in filesystem.json()["directories"]} >= {"team", "private"}
+
+    outside = client.app.state.settings.filesystem_root.parent / "outside-root"
+    outside.mkdir()
+    rejected = client.post(
+        "/api/owner/filesystem-root",
+        headers=owner_headers,
+        json={"path": str(outside)},
+    )
+    assert rejected.status_code == 403
+
+    changed = client.post(
+        "/api/owner/filesystem-root",
+        headers=owner_headers,
+        json={"path": str(client.app.state.settings.filesystem_root / "team")},
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["remapped_grants"] == 1
+    assert changed.json()["removed_grants"] == 1
+    assert client.get("/api/files?path=/").status_code == 200
+    assert {item["name"] for item in client.get("/api/files?path=/").json()["items"]} == {"hello.txt"}
+
+    grants = client.get("/api/grants").json()
+    assert [(item["path"], item["user_id"]) for item in grants] == [("/", user_id)]
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "alice", USER_PASSWORD)
+    assert client.get("/api/files?path=/").status_code == 200
+    assert client.post(
+        "/api/owner/filesystem-root",
+        headers=csrf(client),
+        json={"path": str(client.app.state.settings.filesystem_root)},
+    ).status_code == 403
+
+
+def test_host_metrics_returns_validated_samples(client: TestClient, tmp_path: Path) -> None:
+    proc = tmp_path / "host-proc"
+    (proc / "net").mkdir(parents=True)
+    (proc / "stat").write_text("cpu 100 0 50 850 0 0 0 0 80 20\n", encoding="ascii")
+    (proc / "meminfo").write_text("MemTotal: 1000 kB\nMemAvailable: 400 kB\n", encoding="ascii")
+    (proc / "uptime").write_text("12345.67 1.0\n", encoding="ascii")
+    (proc / "loadavg").write_text("0.12 0.34 0.56 1/100 200\n", encoding="ascii")
+    (proc / "net" / "dev").write_text(
+        "Inter-| Receive | Transmit\n"
+        " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+        "  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n",
+        encoding="ascii",
+    )
+    settings = replace(client.app.state.settings, host_proc_dir=proc)
+
+    with TestClient(create_app(settings)) as metrics_client:
+        headers = bootstrap(metrics_client)
+        first = metrics_client.get("/api/system/metrics", headers=headers)
+        assert first.status_code == 200, first.text
+        assert first.json()["cpu_percent"] is None
+        assert first.json()["memory"] == {"total": 1024000, "used": 614400, "available": 409600}
+        assert first.json()["network"] == {"received_bytes": 1000, "transmitted_bytes": 2000}
+
+        (proc / "stat").write_text("cpu 110 0 60 930 0 0 0 0 90 30\n", encoding="ascii")
+        (proc / "net" / "dev").write_text(
+            "Inter-| Receive | Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+            "  eth0: 1500 0 0 0 0 0 0 0 2500 0 0 0 0 0 0 0\n",
+            encoding="ascii",
+        )
+        second = metrics_client.get("/api/system/metrics", headers=headers)
+        assert second.status_code == 200, second.text
+        assert second.json()["cpu_percent"] == 20.0
+        assert second.json()["uptime_seconds"] == 12345
+        assert second.json()["load_average"] == [0.12, 0.34, 0.56]
+        assert second.json()["network"] == {"received_bytes": 1500, "transmitted_bytes": 2500}
+
+
+def test_profile_picture_is_private_validated_and_persisted(client: TestClient) -> None:
+    owner_headers = bootstrap(client)
+    owner = client.get("/api/profile")
+    assert owner.status_code == 200
+    assert owner.json()["role"] == "owner"
+    assert owner.json()["avatar"] is None
+
+    png = b"\x89PNG\r\n\x1a\n" + b"browser-optimized-picture"
+    avatar = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    updated = client.put(
+        "/api/profile",
+        headers=owner_headers,
+        json={"avatar": avatar},
+    )
+    assert updated.status_code == 200
+    assert client.get("/api/profile").json()["avatar"] == avatar
+
+    invalid_type = client.put(
+        "/api/profile",
+        headers=csrf(client),
+        json={"avatar": "data:image/svg+xml;base64," + base64.b64encode(b"<svg/>").decode("ascii")},
+    )
+    assert invalid_type.status_code == 400
+    invalid_signature = client.put(
+        "/api/profile",
+        headers=csrf(client),
+        json={"avatar": "data:image/png;base64," + base64.b64encode(b"not png").decode("ascii")},
+    )
+    assert invalid_signature.status_code == 400
+
+    user_id = create_user(client, owner_headers)
+    login(client, "alice", USER_PASSWORD)
+    assert client.get("/api/profile").json()["avatar"] is None
+    own_avatar = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8\xff" + b"alice-avatar").decode("ascii")
+    assert client.put(
+        "/api/profile",
+        headers=csrf(client),
+        json={"avatar": own_avatar},
+    ).status_code == 200
+    assert client.get("/api/profile").json()["avatar"] == own_avatar
+    assert client.get("/api/activity").status_code == 200
+    assert all(row["username"] == "alice" for row in client.get("/api/activity").json())
+    assert all(
+        row["username"] == "alice"
+        for row in client.get("/api/dashboard").json()["recent_activity"]
+    )
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "rootowner", OWNER_PASSWORD)
+    assert client.get("/api/profile").json()["avatar"] == avatar
+    assert any(row["username"] == "rootowner" for row in client.get("/api/activity").json())
+    assert user_id > 0
+
+
+def test_profile_picture_size_is_limited(client: TestClient) -> None:
+    headers = bootstrap(client)
+    too_large = b"\x89PNG\r\n\x1a\n" + b"x" * (128 * 1024)
+    response = client.put(
+        "/api/profile",
+        headers=headers,
+        json={"avatar": "data:image/png;base64," + base64.b64encode(too_large).decode("ascii")},
+    )
+    assert response.status_code == 413
 
 
 def test_virtual_paths_reject_traversal_and_platform_separators() -> None:
