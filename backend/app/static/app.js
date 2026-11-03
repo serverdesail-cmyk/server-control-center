@@ -27,6 +27,7 @@ const state = {
   originalText: "",
   resetUserId: null,
   uploadRequest: null,
+  uploadQueue: null,
   theme: "Midnight",
   metricsTimer: null,
   activityTimer: null,
@@ -40,6 +41,9 @@ const state = {
   rootPickerPath: null,
   rootPickerParent: null,
   workspacePreferences: null,
+  dashboardPreferences: null,
+  quickActionSelection: null,
+  metricHistory: [],
 };
 
 const MENU_ITEMS = [
@@ -51,6 +55,27 @@ const MENU_ITEMS = [
   { key: "settings", view: "appearance", label: "Settings", required: true },
 ];
 const DEFAULT_MENU_ORDER = MENU_ITEMS.map((item) => item.key);
+const DASHBOARD_WIDGET_OPTIONS = [
+  { id: "stats", label: "System overview" },
+  { id: "activity", label: "Recent activity" },
+  { id: "filesystem", label: "Filesystem access" },
+  { id: "quick-actions", label: "Quick actions" },
+];
+const QUICK_ACTIONS = [
+  { id: "files", title: "Files", detail: "Browse the workspace", view: "files", path: "M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3z" },
+  { id: "monitoring", title: "Monitoring", detail: "Live server health", view: "monitoring", path: "M3 12h4l3-8 4 16 3-8h4" },
+  { id: "logs", title: "Activity & logs", detail: "Recent server events", view: "logs", path: "M4 5h16M4 12h16M4 19h10" },
+  { id: "access", title: "Access control", detail: "Manage users and grants", view: "access", ownerOnly: true, path: "M12 3 20 7v5c0 5-3.5 8-8 10-4.5-2-8-5-8-10V7z" },
+  { id: "settings", title: "Settings", detail: "Personalize this workspace", view: "appearance", path: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM19.4 15l1.5 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.7-1l-1.7.7-1.4-2.4L7 15a8 8 0 0 1 0-2l-1.4-1.1L7 9.5l1.7.7a8 8 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.7 1l1.7-.7 1.4 2.4L19.4 13a8 8 0 0 1 0 2z" },
+];
+const DEFAULT_DASHBOARD_PREFERENCES = {
+  widgets: DASHBOARD_WIDGET_OPTIONS.map((item) => item.id),
+  quick_actions: QUICK_ACTIONS.map((item) => item.id),
+  cpu_warning_percent: 85,
+  memory_warning_percent: 90,
+  disk_warning_percent: 90,
+};
+const METRIC_HISTORY_LIMIT = 60;
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -85,10 +110,17 @@ async function api(url, options = {}) {
 }
 
 function showAuth() {
+  if (state.uploadQueue?.active) {
+    state.uploadQueue.canceled = true;
+    state.uploadRequest?.abort();
+  }
   state.user = null;
   clearInterval(state.metricsTimer);
   clearInterval(state.activityTimer);
   state.metricsSample = null;
+  state.metricHistory = [];
+  state.dashboardPreferences = null;
+  state.quickActionSelection = null;
   $("#app-shell").hidden = true;
   $("#auth-view").hidden = false;
   $("#auth-form").reset();
@@ -110,6 +142,10 @@ function showAuth() {
 
 function showApp(user) {
   state.user = user;
+  state.metricHistory = [];
+  state.uploadQueue = null;
+  state.uploadRequest = null;
+  $("#upload-progress").hidden = true;
   $("#auth-view").hidden = true;
   $("#app-shell").hidden = false;
   $("#profile-name").textContent = user.username;
@@ -117,6 +153,7 @@ function showApp(user) {
   $("#avatar-letter").textContent = user.username.slice(0, 1).toUpperCase();
   $$(".owner-only").forEach((el) => { el.hidden = user.role !== "owner"; });
   loadWorkspacePreferences();
+  loadDashboardPreferences();
   loadProfile();
   recordClientActivity("session_started");
   navigate("dashboard");
@@ -320,6 +357,156 @@ function renderMenuSettings() {
   }
 }
 
+function accessibleQuickActions() {
+  const preferences = state.dashboardPreferences;
+  if (!preferences) return [];
+  return QUICK_ACTIONS.filter((action) =>
+    preferences.quick_actions.includes(action.id)
+    && (!action.ownerOnly || state.user?.role === "owner"));
+}
+
+function readQuickActionSelection() {
+  const availableIds = new Set(QUICK_ACTIONS.map((action) => action.id));
+  try {
+    const saved = JSON.parse(localStorage.getItem(`scc-quick-actions:${state.user.id}`) || "null");
+    state.quickActionSelection = Array.isArray(saved)
+      ? [...new Set(saved.filter((item) => availableIds.has(item)))]
+      : accessibleQuickActions().map((action) => action.id);
+  } catch (error) {
+    state.quickActionSelection = accessibleQuickActions().map((action) => action.id);
+    toast(`Saved quick actions could not be read: ${error.message}`, true);
+  }
+}
+
+function renderQuickActions() {
+  const grid = $("#quick-action-grid");
+  if (!grid || !state.dashboardPreferences || !state.quickActionSelection) return;
+  grid.replaceChildren();
+  const available = new Map(accessibleQuickActions().map((action) => [action.id, action]));
+  const selected = state.quickActionSelection
+    .map((id) => available.get(id))
+    .filter(Boolean);
+  for (const action of selected) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "quick-action";
+    button.title = action.detail;
+    button.setAttribute("aria-label", `${action.title}: ${action.detail}`);
+    const icon = document.createElement("span");
+    icon.className = "quick-action-icon";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", action.path);
+    svg.append(path);
+    icon.append(svg);
+    const title = document.createElement("strong");
+    title.textContent = action.title;
+    const detail = document.createElement("small");
+    detail.textContent = action.detail;
+    button.append(icon, title, detail);
+    button.addEventListener("click", () => {
+      if (action.view === "access" && state.user?.role !== "owner") return;
+      navigate(action.view);
+    });
+    grid.append(button);
+  }
+  if (!accessibleQuickActions().length) {
+    $("#quick-actions-empty").textContent = "Root_user has not made any quick actions available for your account.";
+  } else {
+    $("#quick-actions-empty").textContent = "No shortcuts selected. Choose some in Settings.";
+  }
+  $("#quick-actions-empty").hidden = selected.length > 0;
+  renderPersonalActionOptions();
+}
+
+function applyDashboardPreferences() {
+  if (!state.dashboardPreferences) return;
+  const visibleWidgets = new Set(state.dashboardPreferences.widgets);
+  $$("[data-dashboard-widget]").forEach((element) => {
+    element.hidden = !visibleWidgets.has(element.dataset.dashboardWidget);
+  });
+  const dashboardPanels = $$(".dashboard-grid > [data-dashboard-widget]");
+  const visiblePanels = dashboardPanels.filter((element) => !element.hidden);
+  $(".dashboard-grid").hidden = visiblePanels.length === 0;
+  $(".dashboard-grid").classList.toggle("single-panel", visiblePanels.length === 1);
+  renderQuickActions();
+}
+
+function renderOptionList(container, options, selected, onChange) {
+  container.replaceChildren();
+  for (const option of options) {
+    const label = document.createElement("label");
+    label.className = "dashboard-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = option.id;
+    checkbox.checked = selected.includes(option.id);
+    checkbox.addEventListener("change", () => onChange(checkbox));
+    const text = document.createElement("span");
+    text.textContent = option.label;
+    label.append(checkbox, text);
+    container.append(label);
+  }
+}
+
+function renderOwnerDashboardSettings() {
+  const preferences = state.dashboardPreferences;
+  if (state.user?.role !== "owner" || !preferences) return;
+  renderOptionList(
+    $("#owner-widget-options"),
+    DASHBOARD_WIDGET_OPTIONS,
+    preferences.widgets,
+    () => {},
+  );
+  renderOptionList(
+    $("#owner-action-options"),
+    QUICK_ACTIONS.map(({ id, title }) => ({ id, label: title })),
+    preferences.quick_actions,
+    () => {},
+  );
+  $("#cpu-warning-threshold").value = preferences.cpu_warning_percent;
+  $("#memory-warning-threshold").value = preferences.memory_warning_percent;
+  $("#disk-warning-threshold").value = preferences.disk_warning_percent;
+}
+
+function renderPersonalActionOptions() {
+  const container = $("#personal-action-options");
+  if (!container || !state.quickActionSelection) return;
+  renderOptionList(
+    container,
+    accessibleQuickActions().map(({ id, title }) => ({ id, label: title })),
+    state.quickActionSelection,
+    (checkbox) => {
+      const selected = new Set(state.quickActionSelection);
+      if (checkbox.checked) selected.add(checkbox.value);
+      else selected.delete(checkbox.value);
+      state.quickActionSelection = [...selected];
+      try {
+        localStorage.setItem(`scc-quick-actions:${state.user.id}`, JSON.stringify(state.quickActionSelection));
+      } catch (error) {
+        toast(`Could not save your quick actions: ${error.message}`, true);
+      }
+      renderQuickActions();
+    },
+  );
+}
+
+async function loadDashboardPreferences() {
+  try {
+    const preferences = await api("/api/dashboard/preferences");
+    state.dashboardPreferences = preferences;
+    readQuickActionSelection();
+    applyDashboardPreferences();
+    renderOwnerDashboardSettings();
+    const sample = state.metricHistory[state.metricHistory.length - 1];
+    if (sample) updateHealthStatus(sample.cpu, sample.memory, sample.disk);
+  } catch (error) {
+    toast(`Could not load dashboard settings: ${error.message}`, true);
+  }
+}
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return "—";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -340,9 +527,11 @@ async function loadDashboard() {
   try {
     const data = await api("/api/dashboard");
     state.lastServerActivity = data.recent_activity;
+    const diskPercent = percentage(data.disk.used, data.disk.total);
     $("#disk-used").textContent = `${formatBytes(data.disk.used)} / ${formatBytes(data.disk.total)}`;
     $("#disk-caption").textContent = `${formatBytes(data.disk.free)} available`;
-    $("#disk-meter").style.width = `${Math.min(100, data.disk.total ? data.disk.used / data.disk.total * 100 : 0)}%`;
+    $("#disk-meter").style.width = `${diskPercent}%`;
+    setProgressRing("#disk-ring", "#disk-ring-value", diskPercent, `${diskPercent.toFixed(0)}%`);
     $("#uptime").textContent = formatDuration(data.uptime_seconds);
     $("#app-version").textContent = `v${data.version}`;
     $("#footer-version").textContent = data.version;
@@ -404,6 +593,17 @@ async function loadMetrics() {
     $("#monitor-memory-ring-value").textContent = `${memoryPercent.toFixed(0)}%`;
     $("#monitor-memory-free").textContent = `${formatBytes(data.memory.available)} available · ${memoryPercent.toFixed(1)}% used`;
 
+    const diskPercent = percentage(data.disk.used, data.disk.total);
+    setProgressRing("#monitor-disk-ring", "#monitor-disk-ring-value", diskPercent, `${diskPercent.toFixed(0)}%`);
+    $("#monitor-disk").textContent = `${formatBytes(data.disk.used)} / ${formatBytes(data.disk.total)}`;
+    $("#monitor-disk-meter").style.width = `${diskPercent}%`;
+    $("#monitor-disk-free").textContent = `${formatBytes(data.disk.free)} available · ${diskPercent.toFixed(1)}% used`;
+    if (cpu !== null) {
+      state.metricHistory.push({ cpu, memory: memoryPercent, disk: diskPercent });
+      state.metricHistory = state.metricHistory.slice(-METRIC_HISTORY_LIMIT);
+      renderMetricHistory();
+    }
+
     $("#uptime").textContent = formatDuration(data.uptime_seconds);
     $("#load-caption").textContent = `Load ${data.load_average.map((value) => value.toFixed(2)).join(" · ")}`;
     $("#monitor-uptime").textContent = formatDuration(data.uptime_seconds);
@@ -414,6 +614,7 @@ async function loadMetrics() {
     $("#monitor-tx").textContent = `↑ ${transmittedRate === null ? "…" : formatRate(transmittedRate)}`;
     $("#monitor-network-total").textContent =
       `${formatBytes(data.network.received_bytes)} received · ${formatBytes(data.network.transmitted_bytes)} sent since boot`;
+    updateHealthStatus(cpu, memoryPercent, diskPercent);
   } catch (error) {
     state.metricsSample = null;
     $("#metrics-status").textContent = "UNAVAILABLE";
@@ -439,7 +640,54 @@ async function loadMetrics() {
     $("#monitor-rx").textContent = "↓ —";
     $("#monitor-tx").textContent = "↑ —";
     $("#monitor-network-total").textContent = "Host telemetry unavailable";
+    $("#monitor-disk").textContent = "Unavailable";
+    $("#monitor-disk-free").textContent = "Workspace disk telemetry unavailable";
+    $("#monitor-disk-meter").style.width = "0";
+    setProgressRing("#monitor-disk-ring", "#monitor-disk-ring-value", 0, "—");
+    $("#health-indicator").classList.remove("warning");
+    $("#health-indicator").classList.add("error");
+    $("#health-status").textContent = "Telemetry unavailable";
+    $("#health-detail").textContent = error.message || "Host telemetry unavailable";
     $("#metrics-updated").textContent = error.message || "Host telemetry unavailable";
+  }
+}
+
+function updateHealthStatus(cpu, memory, disk) {
+  const preferences = state.dashboardPreferences || DEFAULT_DASHBOARD_PREFERENCES;
+  if (cpu === null) {
+    $("#health-indicator").classList.remove("warning", "error");
+    $("#health-status").textContent = "Sampling";
+    $("#health-detail").textContent = "Waiting for the first CPU sample.";
+    return;
+  }
+  const warnings = [];
+  if (cpu >= preferences.cpu_warning_percent) warnings.push(`CPU ${cpu.toFixed(0)}%`);
+  if (memory >= preferences.memory_warning_percent) warnings.push(`memory ${memory.toFixed(0)}%`);
+  if (disk >= preferences.disk_warning_percent) warnings.push(`disk ${disk.toFixed(0)}%`);
+  const indicator = $("#health-indicator");
+  indicator.classList.remove("error");
+  indicator.classList.toggle("warning", warnings.length > 0);
+  $("#health-status").textContent = warnings.length ? "Resource warning" : "All clear";
+  $("#health-detail").textContent = warnings.length
+    ? `${warnings.join(" · ")} above the Root_user warning threshold.`
+    : "CPU, memory, and workspace disk are below their warning thresholds.";
+}
+
+function renderMetricHistory() {
+  const lines = [
+    ["#history-cpu", "cpu"],
+    ["#history-memory", "memory"],
+    ["#history-disk", "disk"],
+  ];
+  for (const [selector, key] of lines) {
+    const points = state.metricHistory.map((sample, index) => {
+      const x = state.metricHistory.length > 1
+        ? index * 600 / (state.metricHistory.length - 1)
+        : 300;
+      const y = 130 - sample[key] * 1.2;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    $(selector).setAttribute("points", points.join(" "));
   }
 }
 
@@ -776,50 +1024,191 @@ async function deleteFile(item) {
 function uploadFiles(files) {
   const selected = [...files];
   if (!selected.length) return;
-  const form = new FormData();
-  form.append("file", selected[0], selected[0].name);
-  const request = new XMLHttpRequest();
-  state.uploadRequest = request;
+  if (state.uploadQueue?.active) {
+    toast("Wait for the current upload queue to finish or cancel it first.", true);
+    return;
+  }
+  const queue = {
+    directory: state.path,
+    items: selected.map((file) => ({ file, loaded: 0, status: "queued", error: "" })),
+    active: true,
+    canceled: false,
+  };
+  state.uploadQueue = queue;
   $("#upload-progress").hidden = false;
-  $("#upload-label").textContent = `Uploading ${selected[0].name}`;
-  $("#upload-meter").value = 0;
-  request.open("POST", `/api/files/upload?path=${encodeURIComponent(state.path)}`);
-  request.withCredentials = true;
-  request.setRequestHeader("X-CSRF-Token", decodeURIComponent(csrfToken()));
-  request.upload.onprogress = (event) => {
-    if (event.lengthComputable) $("#upload-meter").value = Math.round(event.loaded / event.total * 100);
-  };
-  request.onload = async () => {
-    state.uploadRequest = null;
-    $("#upload-progress").hidden = true;
-    if (request.status >= 200 && request.status < 300) {
-      toast(`Uploaded ${selected[0].name}.`);
-      await loadFiles(state.path);
-      if (selected.length > 1) uploadFiles(selected.slice(1));
-    } else {
-      let message = `Upload failed (${request.status})`;
-      try { message = JSON.parse(request.responseText).detail || message; } catch { /* Response may be plain text. */ }
-      toast(message, true);
+  renderUploadQueue(queue);
+  void runUploadQueue(queue);
+}
+
+function renderUploadQueue(queue) {
+  const list = $("#upload-queue-list");
+  list.replaceChildren();
+  const totalBytes = queue.items.reduce((total, item) => total + item.file.size, 0);
+  const uploadedBytes = queue.items.reduce((total, item) => {
+    if (item.status === "complete") return total + item.file.size;
+    if (item.status === "uploading") return total + item.loaded;
+    return total;
+  }, 0);
+  const finished = queue.items.filter((item) => item.status === "complete").length;
+  const failed = queue.items.filter((item) => item.status === "failed").length;
+  const canceled = queue.items.filter((item) => item.status === "canceled").length;
+  const current = queue.items.find((item) => item.status === "uploading");
+  $("#upload-label").textContent = current ? `Uploading ${current.file.name}` : queue.active ? "Preparing uploads" : "Upload queue complete";
+  $("#upload-count").textContent = `${finished} uploaded · ${failed} failed · ${canceled} canceled · ${queue.items.length} files`;
+  const percentage = totalBytes
+    ? uploadedBytes / totalBytes * 100
+    : finished / Math.max(1, queue.items.length) * 100;
+  $("#upload-meter").value = Math.min(100, Math.round(percentage));
+  $("#upload-status").textContent = queue.active
+    ? current ? `File ${queue.items.indexOf(current) + 1} of ${queue.items.length}` : "Starting next file…"
+    : queue.canceled ? "Queue canceled; remaining files were skipped." : "All selected files were attempted.";
+  $("#cancel-upload").hidden = !queue.active;
+  $("#clear-upload-queue").hidden = queue.active;
+
+  for (const item of queue.items) {
+    const row = document.createElement("li");
+    row.className = `upload-queue-item ${item.status}`;
+    const info = document.createElement("span");
+    info.className = "upload-file-info";
+    const name = document.createElement("strong");
+    name.textContent = item.file.name;
+    const detail = document.createElement("small");
+    detail.textContent = item.error || formatBytes(item.file.size);
+    info.append(name, detail);
+    const progress = document.createElement("progress");
+    progress.max = 100;
+    progress.value = item.status === "complete"
+      ? 100
+      : item.file.size ? Math.min(100, item.loaded / item.file.size * 100) : 0;
+    progress.setAttribute("aria-label", `${item.file.name} upload progress`);
+    const status = document.createElement("span");
+    status.className = "upload-file-status";
+    status.textContent = ({
+      queued: "Queued",
+      uploading: "Uploading",
+      complete: "Done",
+      failed: "Failed",
+      canceled: "Canceled",
+    })[item.status];
+    const actions = document.createElement("span");
+    actions.className = "upload-row-actions";
+    actions.append(status);
+    if (item.status === "failed" && !queue.active) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "text-button upload-retry";
+      retry.textContent = "Retry";
+      retry.setAttribute("aria-label", `Retry ${item.file.name}`);
+      retry.addEventListener("click", () => {
+        if (queue.active) return;
+        item.loaded = 0;
+        item.error = "";
+        item.status = "queued";
+        queue.canceled = false;
+        queue.active = true;
+        renderUploadQueue(queue);
+        void runUploadQueue(queue);
+      });
+      actions.append(retry);
     }
-  };
-  request.onerror = () => {
-    state.uploadRequest = null;
-    $("#upload-progress").hidden = true;
-    toast("Upload failed due to a network error.", true);
-  };
-  request.onabort = () => {
-    state.uploadRequest = null;
-    $("#upload-progress").hidden = true;
-    toast("Upload canceled.");
-  };
-  request.send(form);
+    row.append(info, progress, actions);
+    list.append(row);
+  }
+}
+
+function uploadOneFile(queue, item) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", item.file, item.file.name);
+    const request = new XMLHttpRequest();
+    state.uploadRequest = request;
+    request.open("POST", `/api/files/upload?path=${encodeURIComponent(queue.directory)}`);
+    request.withCredentials = true;
+    request.setRequestHeader("X-CSRF-Token", decodeURIComponent(csrfToken()));
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        item.loaded = Math.min(item.file.size, event.loaded);
+        renderUploadQueue(queue);
+      }
+    };
+    request.onload = () => {
+      if (request.status === 401) {
+        reject(new Error("Your session expired. Sign in again."));
+        showAuth();
+        return;
+      }
+      if (request.status >= 200 && request.status < 300) {
+        resolve();
+        return;
+      }
+      let message = `Upload failed (${request.status})`;
+      try {
+        const result = JSON.parse(request.responseText);
+        if (typeof result.detail === "string") message = result.detail;
+      } catch {
+        if (request.responseText) message = request.responseText;
+      }
+      reject(new Error(message));
+    };
+    request.onerror = () => reject(new Error("Network error while uploading this file."));
+    request.onabort = () => reject(new Error("Upload canceled."));
+    request.onloadend = () => { state.uploadRequest = null; };
+    request.send(form);
+  });
+}
+
+async function runUploadQueue(queue) {
+  for (const item of queue.items) {
+    if (queue.canceled) break;
+    if (item.status !== "queued") continue;
+    item.status = "uploading";
+    renderUploadQueue(queue);
+    try {
+      await uploadOneFile(queue, item);
+      item.status = "complete";
+      if (state.activeView === "files" && state.path === queue.directory) {
+        await loadFiles(queue.directory);
+      }
+    } catch (error) {
+      item.status = queue.canceled ? "canceled" : "failed";
+      item.error = error.message;
+      if (!queue.canceled) {
+        recordClientActivity("file_upload_failed", `${item.file.name}: ${error.message}`);
+      }
+    }
+    renderUploadQueue(queue);
+  }
+  if (queue.canceled) {
+    for (const item of queue.items) {
+      if (item.status === "queued") item.status = "canceled";
+    }
+  }
+  queue.active = false;
+  state.uploadRequest = null;
+  renderUploadQueue(queue);
+  const uploaded = queue.items.filter((item) => item.status === "complete").length;
+  const failed = queue.items.filter((item) => item.status === "failed");
+  const skipped = queue.items.filter((item) => item.status === "canceled").length;
+  const summary = `Upload queue ${queue.canceled ? "canceled" : "finished"}: ${uploaded} uploaded, ${failed.length} failed, ${skipped} canceled.`;
+  const failureDetails = failed.slice(0, 3).map((item) => `${item.file.name}: ${item.error}`).join(" · ");
+  toast(failureDetails ? `${summary} ${failureDetails}` : summary, failed.length > 0);
 }
 
 $("#upload-input").addEventListener("change", (event) => {
   uploadFiles(event.currentTarget.files);
   event.currentTarget.value = "";
 });
-$("#cancel-upload").addEventListener("click", () => state.uploadRequest?.abort());
+$("#cancel-upload").addEventListener("click", () => {
+  const queue = state.uploadQueue;
+  if (!queue?.active) return;
+  queue.canceled = true;
+  state.uploadRequest?.abort();
+});
+$("#clear-upload-queue").addEventListener("click", () => {
+  if (state.uploadQueue?.active) return;
+  state.uploadQueue = null;
+  $("#upload-progress").hidden = true;
+});
 $("#new-folder").addEventListener("click", makeFolder);
 $("#new-file").addEventListener("click", makeFile);
 $("#file-filter").addEventListener("input", renderFiles);
@@ -1152,6 +1541,33 @@ $("#grant-form").addEventListener("submit", async (event) => {
     });
     toast("Folder grant saved.");
     await loadAdmin();
+  } catch (error) { toast(error.message, true); }
+});
+
+$("#dashboard-preferences-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (state.user?.role !== "owner") {
+    toast("Only Root_user can change the shared dashboard.", true);
+    return;
+  }
+  const body = {
+    widgets: $$("input:checked", $("#owner-widget-options")).map((input) => input.value),
+    quick_actions: $$("input:checked", $("#owner-action-options")).map((input) => input.value),
+    cpu_warning_percent: Number($("#cpu-warning-threshold").value),
+    memory_warning_percent: Number($("#memory-warning-threshold").value),
+    disk_warning_percent: Number($("#disk-warning-threshold").value),
+  };
+  try {
+    state.dashboardPreferences = await api("/api/owner/dashboard/preferences", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    applyDashboardPreferences();
+    renderOwnerDashboardSettings();
+    const sample = state.metricHistory[state.metricHistory.length - 1];
+    if (sample) updateHealthStatus(sample.cpu, sample.memory, sample.disk);
+    toast("Shared dashboard settings saved.");
+    recordClientActivity("dashboard_preferences_changed");
   } catch (error) { toast(error.message, true); }
 });
 

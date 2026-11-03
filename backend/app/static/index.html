@@ -67,8 +67,8 @@
             <div><h2>Your server at a glance</h2><p class="muted">A secure workspace for the paths you choose to share.</p></div>
             <button class="button primary" data-nav="files">Open file manager <span aria-hidden="true">→</span></button>
           </div>
-          <div id="stats-grid" class="stats-grid">
-            <article class="stat-card"><span class="stat-icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 8h10M7 12h10M7 16h6"/></svg></span><span class="stat-label">Storage used</span><strong id="disk-used">—</strong><small id="disk-caption">Loading storage information</small><div class="meter"><i id="disk-meter"></i></div></article>
+          <div id="stats-grid" class="stats-grid" data-dashboard-widget="stats">
+            <article class="stat-card ring-stat"><span class="stat-icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 8h10M7 12h10M7 16h6"/></svg></span><span class="stat-label">Filesystem volume</span><div class="stat-ring" id="disk-ring" aria-label="Filesystem volume used"><strong id="disk-ring-value">—</strong></div><strong id="disk-used">—</strong><small id="disk-caption">Loading storage information</small><div class="meter"><i id="disk-meter"></i></div></article>
             <article class="stat-card ring-stat"><span class="stat-icon violet"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><span class="stat-label">Server CPU</span><div class="stat-ring" id="cpu-ring" aria-label="CPU utilization"><strong id="cpu-ring-value">—</strong></div><strong id="cpu-value">—</strong><small id="cpu-caption">Waiting for sample</small><div class="meter"><i id="cpu-meter"></i></div></article>
             <article class="stat-card ring-stat"><span class="stat-icon green"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></span><span class="stat-label">Server memory</span><div class="stat-ring green-ring" id="memory-ring" aria-label="Memory utilization"><strong id="memory-ring-value">—</strong></div><strong id="memory-used">—</strong><small id="memory-caption">Waiting for sample</small><div class="meter"><i id="memory-meter"></i></div></article>
             <article class="stat-card"><span class="stat-icon amber"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><span class="stat-label">Server uptime</span><strong id="uptime">—</strong><small id="load-caption">Load average —</small></article>
@@ -76,18 +76,18 @@
             <article class="stat-card owner-only" hidden><span class="stat-icon amber"><svg viewBox="0 0 24 24"><path d="M16 20v-1a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v1M10 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M18 8v6M21 11h-6"/></svg></span><span class="stat-label">Active sessions</span><strong id="sessions">—</strong><small>Current signed-in sessions</small></article>
           </div>
           <div class="dashboard-grid">
-            <section class="panel activity-panel">
+            <section class="panel activity-panel" data-dashboard-widget="activity">
               <div class="panel-heading"><div><h3>Recent activity</h3><p class="muted">Server events and this browser</p></div><button class="text-button" data-nav="logs">Open logs →</button></div>
               <div id="activity-list" class="activity-list"><p class="empty-state">Activity will appear here.</p></div>
             </section>
-            <section class="panel status-panel">
+            <section class="panel status-panel" data-dashboard-widget="filesystem">
               <div class="panel-heading"><div><h3>Filesystem access</h3><p class="muted">Root_user access is unrestricted inside the active root.</p></div><span class="status-dot"></span></div>
               <div class="root-display"><span class="root-icon"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3z"/></svg></span><div><small>ACTIVE ROOT</small><strong id="root-path">—</strong></div></div>
               <p class="notice">Host mount boundary: <strong id="mount-root">—</strong>. Other accounts need folder grants; Linux permissions still apply.</p>
               <button class="button secondary owner-only" data-nav="access" hidden>Review folder grants</button>
             </section>
           </div>
-          <section class="panel quick-actions"><div class="panel-heading"><div><h3>Quick actions</h3><p class="muted">Useful tools at a glance.</p></div></div><div class="quick-action-grid"><button class="quick-action" data-nav="monitoring"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><span><strong>Live monitoring</strong><small>CPU, memory and traffic</small></span></button><button class="quick-action" data-nav="logs"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/></svg></span><span><strong>Activity &amp; logs</strong><small>Server and this-browser history</small></span></button></div></section>
+          <section class="panel quick-actions" data-dashboard-widget="quick-actions"><div class="panel-heading"><div><h3>Quick actions</h3><p class="muted">Your favorite places, one tap away.</p></div></div><div id="quick-action-grid" class="quick-action-grid"></div><p id="quick-actions-empty" class="empty-state" hidden>No shortcuts selected. Choose some in Settings.</p></section>
         </section>
 
         <section id="monitoring-view" class="view" hidden>
@@ -96,9 +96,22 @@
             <article class="panel metric-panel"><div class="panel-heading"><div><h3>Processor</h3><p class="muted">Total host CPU utilization</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span></div><div class="metric-ring" id="monitor-cpu-ring"><strong id="monitor-cpu-ring-value">—</strong></div><strong id="monitor-cpu" class="metric-value-detail">Sampling…</strong><div class="meter"><i id="monitor-cpu-meter"></i></div><small id="monitor-load" class="muted">Load average —</small></article>
             <article class="panel metric-panel"><div class="panel-heading"><div><h3>Memory</h3><p class="muted">Host memory in use</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 8h6M9 12h6"/></svg></span></div><div class="metric-ring green-ring" id="monitor-memory-ring"><strong id="monitor-memory-ring-value">—</strong></div><strong id="monitor-memory" class="metric-value-detail">—</strong><div class="meter"><i id="monitor-memory-meter"></i></div><small id="monitor-memory-free" class="muted">Available —</small></article>
             <article class="panel metric-panel"><div class="panel-heading"><div><h3>Network</h3><p class="muted">Combined non-loopback interfaces</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M4 12h16M12 4l8 8-8 8"/></svg></span></div><strong id="monitor-rx">↓ —</strong><small id="monitor-tx" class="muted">↑ —</small><small id="monitor-network-total" class="muted">Since host boot</small></article>
+            <article class="panel metric-panel"><div class="panel-heading"><div><h3>Filesystem volume</h3><p class="muted">Volume containing the active root</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 8h10M7 12h10M7 16h6"/></svg></span></div><div class="metric-ring amber-ring" id="monitor-disk-ring"><strong id="monitor-disk-ring-value">—</strong></div><strong id="monitor-disk" class="metric-value-detail">—</strong><div class="meter"><i id="monitor-disk-meter"></i></div><small id="monitor-disk-free" class="muted">Available —</small></article>
             <article class="panel metric-panel"><div class="panel-heading"><div><h3>Host uptime</h3><p class="muted">Time since Linux boot</p></div><span class="metric-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span></div><strong id="monitor-uptime">—</strong><small id="metrics-updated" class="muted">Last sample —</small></article>
           </div>
-          <section class="panel monitor-note"><h3>Monitoring scope</h3><p class="muted">SCC reads host CPU, memory, uptime, load and network counters through read-only Linux proc files. It does not inspect process command lines, control Docker, or change server settings.</p></section>
+          <section class="panel health-panel" aria-live="polite"><span id="health-indicator" class="status-dot"></span><strong id="health-status">Collecting health data</strong><span id="health-detail" class="muted">Resource warnings appear here.</span></section>
+          <section class="panel history-panel">
+            <div class="panel-heading"><div><h3>Recent resource trend</h3><p class="muted">Last five minutes · sampled in this browser</p></div><span class="pill">LIVE</span></div>
+            <svg class="metric-history-chart" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-labelledby="history-chart-title history-chart-description">
+              <title id="history-chart-title">Recent CPU, memory, and disk usage</title>
+              <desc id="history-chart-description">A rolling chart of the latest 60 read-only metric samples, stored only while this page is open.</desc>
+              <polyline id="history-cpu" class="history-line cpu-line" points=""></polyline>
+              <polyline id="history-memory" class="history-line memory-line" points=""></polyline>
+              <polyline id="history-disk" class="history-line disk-line" points=""></polyline>
+            </svg>
+            <div class="chart-legend"><span class="cpu-legend">CPU</span><span class="memory-legend">Memory</span><span class="disk-legend">Disk</span></div>
+          </section>
+          <section class="panel monitor-note"><h3>Monitoring scope</h3><p class="muted">SCC reads host CPU, memory, uptime, load and network counters through read-only Linux proc files. Disk usage is for the filesystem volume containing the active root. Trends stay in this browser session; SCC does not inspect process command lines, control Docker, or change server settings.</p></section>
         </section>
 
         <section id="logs-view" class="view" hidden>
@@ -131,7 +144,12 @@
               <span id="file-count" class="muted small-text"></span>
               <div class="view-switch"><button id="list-view" class="active" aria-label="List view">☷</button><button id="grid-view" aria-label="Grid view">▦</button></div>
             </div>
-            <div id="upload-progress" class="upload-progress" hidden><span id="upload-label">Uploading</span><progress id="upload-meter" max="100" value="0"></progress><button id="cancel-upload" class="text-button">Cancel</button></div>
+            <section id="upload-progress" class="upload-progress" aria-live="polite" hidden>
+              <div class="upload-summary"><strong id="upload-label">Preparing uploads</strong><span id="upload-count" class="muted">0 of 0 files</span></div>
+              <progress id="upload-meter" max="100" value="0" aria-label="Overall upload progress"></progress>
+              <div class="upload-controls"><span id="upload-status" class="muted">Waiting</span><button id="cancel-upload" class="text-button" type="button">Cancel queue</button><button id="clear-upload-queue" class="text-button" type="button" hidden>Clear</button></div>
+              <ul id="upload-queue-list" class="upload-queue-list"></ul>
+            </section>
             <div id="file-list" class="file-list"></div>
           </div>
         </section>
@@ -190,6 +208,23 @@
 
         <section id="appearance-view" class="view" hidden>
           <div class="welcome-row"><div><h2>Workspace settings</h2><p class="muted">Personalize your menus, appearance and account.</p></div></div>
+          <section class="panel owner-only dashboard-settings-panel" hidden>
+            <div class="panel-heading"><div><h3>Shared dashboard</h3><p class="muted">Choose which overview sections and shortcuts are available to everyone.</p></div><span class="pill">ROOT_USER</span></div>
+            <form id="dashboard-preferences-form" class="stack">
+              <fieldset class="dashboard-option-group"><legend>Overview sections</legend><div id="owner-widget-options" class="dashboard-option-grid"></div></fieldset>
+              <fieldset class="dashboard-option-group"><legend>Available quick actions</legend><div id="owner-action-options" class="dashboard-option-grid"></div></fieldset>
+              <fieldset class="dashboard-option-group"><legend>Resource warning thresholds</legend><div class="threshold-grid">
+                <label>CPU warning %<input id="cpu-warning-threshold" type="number" min="50" max="99" required></label>
+                <label>Memory warning %<input id="memory-warning-threshold" type="number" min="50" max="99" required></label>
+                <label>Disk warning %<input id="disk-warning-threshold" type="number" min="50" max="99" required></label>
+              </div></fieldset>
+              <div><button class="button primary" type="submit">Save shared dashboard</button></div>
+            </form>
+          </section>
+          <section class="panel personal-actions-panel">
+            <div class="panel-heading"><div><h3>Your quick actions</h3><p class="muted">Pick the circular shortcuts shown on your overview.</p></div><span class="pill">THIS ACCOUNT</span></div>
+            <div id="personal-action-options" class="dashboard-option-grid"></div>
+          </section>
           <section class="panel profile-settings-panel">
             <div class="panel-heading"><div><h3>Your profile</h3><p class="muted">Your profile picture follows your account across devices.</p></div><span class="pill">ACCOUNT</span></div>
             <div class="profile-customizer">
@@ -222,7 +257,7 @@
           </section>
         </section>
 
-        <footer class="footer"><span>SCC <span id="footer-version">0.3.0</span></span><span>Application permissions never replace Linux permissions.</span></footer>
+        <footer class="footer"><span>SCC <span id="footer-version">0.4.0</span></span><span>Application permissions never replace Linux permissions.</span></footer>
       </main>
     </div>
 
