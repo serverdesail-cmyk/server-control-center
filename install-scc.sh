@@ -122,7 +122,7 @@ fi
 
 log "Refreshing SCC application files; existing environment and persistent data are preserved."
 git -C "${source_dir}" ls-files -z | tar -C "${source_dir}" --null -T - -cf - \
-  | tar -C "${INSTALL_DIR}" -xf - || fail "Could not refresh the SCC application files."
+  | tar -C "${INSTALL_DIR}" -xf - || fail "Could not refresh the SCC application files."; sed -i 's/[[:cntrl:]]$//' "${INSTALL_DIR}/management/scc" || fail "Could not normalize the SCC management command line endings."
 mv "${source_dir}/.git" "${INSTALL_DIR}/.git" || fail "Could not install the clean SCC Git metadata."
 chmod 0755 "${INSTALL_DIR}/management/scc" || fail "Could not make the SCC management command executable."
 git_backup_active=0
