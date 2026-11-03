@@ -60,12 +60,13 @@ SCC uses descriptor-relative Linux filesystem operations, refuses symbolic-link 
 - HttpOnly, SameSite cookies; Secure cookies by default; CSRF and same-host Origin checks on browser mutations; login throttling; security headers.
 - Root_user-managed USER and ADMIN accounts, account disable/delete, password reset, and session revocation.
 - Per-user nested folder grants for browsing, reading, downloading, uploading, creating, editing, renaming, and deleting. A deeper grant replaces the inherited rule for that folder.
-- File/folder listing, previews and bounded editing, create, upload with progress/cancel, range downloads, rename and delete.
+- File/folder listing, previews and bounded editing, create, range downloads, rename and delete. Multi-file uploads run one at a time with per-file and overall progress, visible failures, retry, and queue cancellation; a failed file does not discard the rest of the selection.
 - Root_user-selectable active filesystem root inside the fixed host mount, with safe grant remapping and an in-app directory picker.
-- Live host CPU, memory, uptime, load-average, and network-counter monitoring. Selected `/proc` files are mounted read-only; SCC does not inspect process command lines or control the host.
+- Live host CPU, memory, uptime, load-average, network-counter, and filesystem-volume monitoring for the volume containing the active root. Resource warning thresholds and shared overview sections/actions are configurable by Root_user. A rolling 5-minute chart is held in the open browser session; selected `/proc` files are mounted read-only, and SCC does not inspect process command lines or control the host.
 - Separate Logs view with live server audit entries and per-account browser activity kept in that browser's local storage. Regular accounts see only their own server audit records; Root_user can see all. Raw container output remains host-only through `sudo scc logs`.
 - Per-account profile pictures optimized in the browser and stored with the server-side account profile.
 - Six built-in color themes, safe JSON color-theme import/export, and per-device menu visibility and ordering. Menus can be reordered by drag-and-drop or accessible move controls.
+- Circular quick actions can be chosen per account and device; Root_user controls which shared dashboard sections and shortcuts are available.
 - Docker Compose deployment with a read-only container root, dropped Linux capabilities, resource limits, `no-new-privileges`, and an unprivileged container process.
 
 ## Release boundaries
