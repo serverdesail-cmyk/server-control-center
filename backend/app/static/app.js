@@ -822,8 +822,7 @@ function renderBreadcrumbs(path) {
 }
 
 async function loadFiles(path) {
-  // A folder change starts a fresh listing; don't carry the previous
-  // directory's search filter into the newly opened directory.
+  // A folder change starts a fresh listing; do not carry the previous folder search into it.
   if (path !== state.path) $("#file-filter").value = "";
   state.path = path;
   try {
@@ -906,28 +905,48 @@ function makeFileRow(item) {
   modified.textContent = new Date(item.modified).toLocaleString();
   const actions = document.createElement("div");
   actions.className = "file-actions";
-  addAction(
-    actions,
-    "i",
-    "Details",
-    () => toast(`${item.permissions} · UID ${item.uid} · GID ${item.gid} · ${formatBytes(item.size)}`),
-  );
-  if (item.kind === "file" && item.access.includes("download")) addAction(actions, "↓", "Download", () => downloadFile(item));
+  const menu = document.createElement("details");
+  menu.className = "file-menu";
+  const trigger = document.createElement("summary");
+  trigger.textContent = "⋯";
+  trigger.title = `Actions for ${item.name}`;
+  trigger.setAttribute("aria-label", `Actions for ${item.name}`);
+  trigger.addEventListener("click", () => {
+    container.querySelectorAll(".file-menu[open]").forEach((other) => {
+      if (other !== menu) other.open = false;
+    });
+  });
+  const menuItems = document.createElement("div");
+  menuItems.className = "file-menu-items";
+  menu.append(trigger, menuItems);
+  actions.append(menu);
+
+  addAction(menuItems, "ⓘ", "Details", () => toast(`${item.permissions} · UID ${item.uid} · GID ${item.gid} · ${formatBytes(item.size)}`));
+  if (item.kind === "file" && item.access.includes("download")) addAction(menuItems, "↓", "Download", () => downloadFile(item));
   if (item.kind === "file" && item.access.includes("read")) {
     const canEdit = item.access.includes("edit");
-    addAction(actions, canEdit ? "✎" : "◉", canEdit ? "Edit text file" : "Read text file", () => openEditor(item));
+    addAction(menuItems, canEdit ? "✎" : "◉", canEdit ? "Edit" : "Read", () => openEditor(item));
   }
-  if (item.access.includes("rename")) addAction(actions, "✎", "Rename", () => renameFile(item));
-  if (item.access.includes("delete")) addAction(actions, "×", "Delete", () => deleteFile(item));
+  if (item.access.includes("rename")) addAction(menuItems, "✎", "Rename", () => renameFile(item));
+  if (item.access.includes("delete")) addAction(menuItems, "⌫", "Delete", () => deleteFile(item), "danger");
+  menu.addEventListener("click", (event) => {
+    if (event.target.closest(".file-menu-items button")) menu.open = false;
+  });
   row.append(name, size, modified, actions);
   return row;
 }
 
-function addAction(parent, glyph, label, action) {
+function addAction(parent, glyph, label, action, variant = "") {
   const button = document.createElement("button");
-  button.textContent = glyph;
-  button.title = label;
-  button.setAttribute("aria-label", label);
+  button.type = "button";
+  button.className = `file-menu-item ${variant}`.trim();
+  const icon = document.createElement("span");
+  icon.className = "file-menu-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = glyph;
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.append(icon, text);
   button.addEventListener("click", action);
   parent.append(button);
 }
@@ -1214,6 +1233,11 @@ $("#clear-upload-queue").addEventListener("click", () => {
 });
 $("#new-folder").addEventListener("click", makeFolder);
 $("#new-file").addEventListener("click", makeFile);
+document.addEventListener("click", (event) => {
+  $$(".file-menu[open]").forEach((menu) => {
+    if (!menu.contains(event.target)) menu.open = false;
+  });
+});
 $("#file-filter").addEventListener("input", renderFiles);
 $("#list-view").addEventListener("click", () => { state.grid = false; $("#list-view").classList.add("active"); $("#grid-view").classList.remove("active"); renderFiles(); });
 $("#grid-view").addEventListener("click", () => { state.grid = true; $("#grid-view").classList.add("active"); $("#list-view").classList.remove("active"); renderFiles(); recordClientActivity("file_view_changed", "grid"); });
