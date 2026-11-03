@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import sqlite3
 import base64
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -216,6 +217,8 @@ def test_host_metrics_returns_validated_samples(client: TestClient, tmp_path: Pa
         assert first.json()["cpu_percent"] is None
         assert first.json()["memory"] == {"total": 1024000, "used": 614400, "available": 409600}
         assert first.json()["network"] == {"received_bytes": 1000, "transmitted_bytes": 2000}
+        assert first.json()["disk"]["total"] > 0
+        assert first.json()["disk"]["used"] + first.json()["disk"]["free"] == first.json()["disk"]["total"]
 
         (proc / "stat").write_text("cpu 110 0 60 930 0 0 0 0 90 30\n", encoding="ascii")
         (proc / "net" / "dev").write_text(
@@ -230,6 +233,60 @@ def test_host_metrics_returns_validated_samples(client: TestClient, tmp_path: Pa
         assert second.json()["uptime_seconds"] == 12345
         assert second.json()["load_average"] == [0.12, 0.34, 0.56]
         assert second.json()["network"] == {"received_bytes": 1500, "transmitted_bytes": 2500}
+
+
+def test_dashboard_preferences_are_owner_managed_and_persisted(client: TestClient) -> None:
+    assert client.get("/api/dashboard/preferences").status_code == 401
+    owner_headers = bootstrap(client)
+    defaults = client.get("/api/dashboard/preferences")
+    assert defaults.status_code == 200
+    assert defaults.json() == {
+        "widgets": ["stats", "activity", "filesystem", "quick-actions"],
+        "quick_actions": ["files", "monitoring", "logs", "access", "settings"],
+        "cpu_warning_percent": 85,
+        "memory_warning_percent": 90,
+        "disk_warning_percent": 90,
+    }
+
+    create_user(client, owner_headers)
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "alice", USER_PASSWORD)
+    assert client.get("/api/dashboard/preferences").json() == defaults.json()
+    assert client.put(
+        "/api/owner/dashboard/preferences",
+        headers=csrf(client),
+        json=defaults.json(),
+    ).status_code == 403
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    owner_headers = login(client, "rootowner", OWNER_PASSWORD)
+    updated = {
+        "widgets": ["stats", "quick-actions"],
+        "quick_actions": ["files", "monitoring"],
+        "cpu_warning_percent": 80,
+        "memory_warning_percent": 88,
+        "disk_warning_percent": 92,
+    }
+    response = client.put(
+        "/api/owner/dashboard/preferences",
+        headers=owner_headers,
+        json=updated,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == updated
+    assert client.get("/api/dashboard/preferences").json() == updated
+
+    invalid = {**updated, "quick_actions": ["files", "unsupported"]}
+    assert client.put(
+        "/api/owner/dashboard/preferences",
+        headers=owner_headers,
+        json=invalid,
+    ).status_code == 422
+    with sqlite3.connect(client.app.state.settings.database_path) as db:
+        saved = db.execute(
+            "SELECT value FROM app_settings WHERE key = 'dashboard_preferences'"
+        ).fetchone()[0]
+    assert json.loads(saved) == updated
 
 
 def test_profile_picture_is_private_validated_and_persisted(client: TestClient) -> None:
