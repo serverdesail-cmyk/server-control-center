@@ -822,6 +822,9 @@ function renderBreadcrumbs(path) {
 }
 
 async function loadFiles(path) {
+  // A folder change starts a fresh listing; don't carry the previous
+  // directory's search filter into the newly opened directory.
+  if (path !== state.path) $("#file-filter").value = "";
   state.path = path;
   try {
     if (path === "/" && state.user?.role !== "owner") {
