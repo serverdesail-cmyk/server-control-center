@@ -1,0 +1,42 @@
+services:
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: scc-server-control-center:0.1.0
+    container_name: server-control-center
+    init: true
+    restart: unless-stopped
+    user: "${SCC_UID:?Set SCC_UID}:${SCC_GID:?Set SCC_GID}"
+    environment:
+      SCC_DATA_DIR: /data
+      SCC_FILESYSTEM_ROOT: "${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}"
+      SCC_SETUP_TOKEN: "${SCC_SETUP_TOKEN:-}"
+      SCC_COOKIE_SECURE: "${SCC_COOKIE_SECURE:-true}"
+      SCC_MAX_UPLOAD_BYTES: "${SCC_MAX_UPLOAD_BYTES:-1073741824}"
+    ports:
+      - "${SCC_BIND_ADDRESS:-127.0.0.1}:${SCC_PORT:-8787}:8787"
+    volumes:
+      - "${SCC_DATA_PATH:-/var/lib/server-control-center/data}:/data:rw"
+      - "${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}:${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}:rw"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 1.5
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
