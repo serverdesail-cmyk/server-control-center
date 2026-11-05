@@ -332,6 +332,32 @@ def resolve_managed_directory(settings: Settings, requested_path: str) -> tuple[
         return resolved_path, relative.parts
 
 
+def host_temperature() -> dict[str, Any]:
+    """Read the first available Linux thermal-zone or hwmon temperature."""
+    candidates = []
+    for path in (Path("/sys/class/thermal"), Path("/sys/class/hwmon")):
+        try:
+            if path.name == "thermal":
+                for zone in sorted(path.glob("thermal_zone*/temp")):
+                    candidates.append((zone, zone.parent / "type"))
+            else:
+                for sensor in sorted(path.glob("hwmon*/temp*_input")):
+                    candidates.append((sensor, sensor.parent / (sensor.name.replace("_input", "_label"))))
+        except OSError:
+            continue
+    for sensor, label_path in candidates:
+        try:
+            raw = float(sensor.read_text(encoding="ascii").strip())
+            celsius = raw / 1000 if abs(raw) > 200 else raw
+            if not -20 <= celsius <= 150:
+                continue
+            label = label_path.read_text(encoding="ascii").strip() if label_path.exists() else "Host sensor"
+            return {"celsius": round(celsius, 1), "label": label or "Host sensor", "available": True}
+        except (OSError, ValueError):
+            continue
+    return {"celsius": None, "label": None, "available": False}
+
+
 def host_metrics(
     settings: Settings,
     previous_sample: tuple[int, int, float] | None,
@@ -390,6 +416,7 @@ def host_metrics(
         return (
             {
                 "cpu_percent": cpu_percent,
+                "temperature": host_temperature(),
                 "memory": {
                     "total": total_memory,
                     "used": total_memory - available_memory,
@@ -733,6 +760,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
+        return FileResponse(Path(__file__).parent / "static" / "landing.html")
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page():
+        return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard_page():
         return FileResponse(Path(__file__).parent / "static" / "index.html")
 
     @app.get("/api/health")
