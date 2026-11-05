@@ -10,7 +10,7 @@ readonly HEALTH_URL="http://127.0.0.1:$(sed -n 's/^SCC_PORT=//p' "${ENV_FILE}" 2
 
 usage() {
   printf '%s\n' \
-    "Usage: scc {start|stop|restart|update|logs|status|setup-token|uninstall}" \
+    "Usage: scc {start|stop|restart|update|logs|status|setup-token|general-max|user-max|storage-status|storage-reconcile|uninstall}" \
     "  start       Start SCC" \
     "  stop        Stop SCC without deleting stored data" \
     "  restart     Restart SCC" \
@@ -18,6 +18,10 @@ usage() {
     "  logs        Follow service logs" \
     "  status      Show service status" \
     "  setup-token Show the one-time Root_user setup token before first setup" \
+    "  general-max --size N GiB | --unlimited | --show" \
+    "  user-max USER --size N GiB | --unlimited | --show" \
+    "  storage-status Show global storage usage and quota" \
+    "  storage-reconcile Reconcile storage ownership and sizes" \
     "  uninstall   Remove SCC after explicit confirmation"
 }
 
@@ -59,7 +63,113 @@ verify_updated_version() {
   return 1
 }
 
+storage_cli() {
+  local data_path db_path
+  data_path="$(sed -n 's/^SCC_DATA_PATH=//p' "${ENV_FILE}" | tail -n 1)"
+  [[ -n "${data_path}" ]] || data_path="${DATA_DIR}/data"
+  db_path="${data_path}/scc.sqlite3"
+  [[ -f "${db_path}" ]] || { printf 'SCC database not found at configured data path. Start SCC once first.\\n' >&2; return 1; }
+  python3 - "${db_path}" "$@" <<'PY'
+import sqlite3,sys,math
+db=sqlite3.connect(sys.argv[1],timeout=10)
+db.row_factory=sqlite3.Row
+args=sys.argv[2:]
+def fail(msg): print("scc: "+msg,file=sys.stderr); raise SystemExit(2)
+def get_global():
+ r=db.execute("select value from app_settings where key='global_storage_limit_bytes'").fetchone()
+ return None if not r or r[0]=='unlimited' else int(r[0])
+def fmt(n): return "unlimited" if n is None else f"{n/1024**3:.2f} GiB"
+cmd=args.pop(0) if args else ""
+if cmd=="general-max":
+ if args==["--show"]:
+  print("Global limit:",fmt(get_global()))
+ elif args==["--unlimited"]:
+  db.execute("update app_settings set value='unlimited' where key='global_storage_limit_bytes'"); db.commit(); print("Global quota set to unlimited.")
+ elif len(args)==2 and args[0]=="--size":
+  try: n=float(args[1])
+  except ValueError: fail("size must be a positive number of GiB")
+  if not math.isfinite(n) or n<=0: fail("size must be a positive number of GiB")
+  b=int(n*1024**3)
+  if b<1: fail("size is too small")
+  db.execute("update app_settings set value=? where key='global_storage_limit_bytes'",(str(b),)); db.commit(); print("Global limit set to",fmt(b))
+ else: fail("usage: scc general-max --size N | --unlimited | --show")
+elif cmd=="user-max":
+ if not args: fail("username required")
+ name=args.pop(0); row=db.execute("select id from users where username=? collate nocase",(name,)).fetchone()
+ if not row: fail("user not found")
+ if args==["--show"]:
+  r=db.execute("select max_storage_bytes from users where id=?",(row[0],)).fetchone()
+  print(name+":",fmt(r[0]))
+ elif args==["--unlimited"]:
+  db.execute("update users set max_storage_bytes=NULL where id=?",(row[0],)); db.commit(); print(name+": unlimited")
+ elif len(args)==2 and args[0]=="--size":
+  try: n=float(args[1])
+  except ValueError: fail("size must be a positive number of GiB")
+  if not math.isfinite(n) or n<=0: fail("size must be a positive number of GiB")
+  b=int(n*1024**3); g=get_global()
+  if g is not None and b>g: fail("user quota cannot exceed global limit")
+  db.execute("update users set max_storage_bytes=? where id=?",(b,row[0])); db.commit(); print(name+":",fmt(b))
+ else: fail("usage: scc user-max USER --size N | --unlimited | --show")
+elif cmd=="storage-status":
+ g=get_global(); print("Global configured limit:",fmt(g))
+ print("Per-user configured quotas:")
+ for r in db.execute("select username,max_storage_bytes from users order by username"):
+  print(" ",r[0]+":",fmt(r[1]))
+ root=__import__("os").environ.get("SCC_HOST_ROOT","")
+ # Read the non-secret path setting from the protected installer environment.
+ envfile="/opt/server-control-center/.env"
+ try:
+  for line in open(envfile):
+   if line.startswith("SCC_HOST_ROOT="): root=line.strip().split("=",1)[1]
+ except OSError: pass
+ if root:
+  import os,stat
+  used=0
+  for base,dirs,files in os.walk(root,followlinks=False):
+   dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(base,d))]
+   for name in files:
+    path=os.path.join(base,name)
+    try:
+     st=os.lstat(path)
+     if stat.S_ISREG(st.st_mode): used+=st.st_size
+    except OSError: pass
+  print("Current filesystem usage:",fmt(used))
+  if g is not None: print("Remaining:",fmt(max(0,g-used)))
+ print("Per-user usage requires a reconciliation through the application API; ownership is not inferred by this CLI.")
+elif cmd=="storage-reconcile":
+ import os,stat,time
+ envfile="/opt/server-control-center/.env"; root=None
+ try:
+  for line in open(envfile):
+   if line.startswith("SCC_HOST_ROOT="): root=line.strip().split("=",1)[1]
+ except OSError: pass
+ if not root or not os.path.isdir(root): fail("SCC_HOST_ROOT is unavailable; cannot reconcile filesystem")
+ known={r[0]:r[1] for r in db.execute("select path,user_id from storage_ownership where known=1")}
+ seen=set(); total=unknown=0
+ for base,dirs,files in os.walk(root,followlinks=False):
+  dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(base,d))]
+  for name in files:
+   full=os.path.join(base,name)
+   try:
+    st=os.lstat(full)
+    if not stat.S_ISREG(st.st_mode): continue
+    rel="/"+os.path.relpath(full,root).replace(os.sep,"/")
+    uid=known.get(rel); seen.add(rel); total+=st.st_size
+    if uid is None: unknown+=st.st_size
+    db.execute("insert into storage_ownership(path,user_id,size_bytes,mtime_ns,known,updated_at) values(?,?,?,?,?,?) on conflict(path) do update set size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,updated_at=excluded.updated_at",(rel,uid,st.st_size,st.st_mtime_ns,int(uid is not None),int(time.time())))
+   except OSError: pass
+ for r in db.execute("select path from storage_ownership").fetchall():
+  if r[0] not in seen: db.execute("delete from storage_ownership where path=?",(r[0],))
+ db.commit()
+ print(f"Reconciled files. Usage: {fmt(total)}; unknown ownership: {fmt(unknown)}")
+else: fail("unknown storage command")
+PY
+}
+
 case "${1:-}" in
+  general-max|user-max|storage-status|storage-reconcile)
+    storage_cli "$@"
+    ;;
   start)
     compose up --detach
     ;;
