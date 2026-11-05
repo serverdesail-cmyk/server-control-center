@@ -49,7 +49,6 @@ const state = {
 const MENU_ITEMS = [
   { key: "dashboard", view: "dashboard", label: "Overview", required: true },
   { key: "files", view: "files", label: "Files" },
-  { key: "minecraft", view: "minecraft", label: "Minecraft" },
   { key: "monitoring", view: "monitoring", label: "Monitoring" },
   { key: "access", view: "access", label: "Access control", ownerOnly: true },
   { key: "logs", view: "logs", label: "Logs" },
@@ -158,7 +157,7 @@ function showApp(user) {
   loadProfile();
   recordClientActivity("session_started");
   const requestedSection = new URLSearchParams(window.location.search).get("section");
-  const allowedSections = ["dashboard", "files", "monitoring", "logs", "minecraft"];
+  const allowedSections = ["dashboard", "files", "monitoring", "logs"];
   navigate(allowedSections.includes(requestedSection) ? requestedSection : "dashboard");
   loadDashboard();
   startMetricsPolling();
@@ -205,14 +204,12 @@ function navigate(view) {
     monitoring: ["SERVER HEALTH", "Monitoring"],
     access: ["ROOT_USER CONTROL", "Access control"],
     logs: ["ACTIVITY", "Logs"],
-    minecraft: ["SERVER TOOLS", "Minecraft moderation"],
     appearance: ["WORKSPACE", "Settings"],
   };
   const [eyebrow, title] = titles[view] || titles.dashboard;
   $("#section-eyebrow").textContent = eyebrow;
   $("#section-title").textContent = title;
   if (view === "files") loadFiles(state.path);
-  if (view === "minecraft") loadMinecraft();
   if (view === "access" && state.user?.role === "owner") loadAdmin();
   if (view === "monitoring") loadMetrics();
   if (view === "logs") loadActivity();
@@ -1824,10 +1821,3 @@ $$(".main-nav .nav-item").forEach((item) => {
 
 bootstrap();
 
-
-async function loadMinecraft(){
-  const status=$("#mc-status"),stateEl=$("#mc-state"),players=$("#mc-players"),address=$("#mc-address"),consoleEl=$("#mc-console");
-  try{const data=await api("/api/minecraft/status");status.textContent=data.configured?(data.online?"Online":"Unavailable"):"Not configured";stateEl.textContent=data.configured?(data.online?"Online":"Offline"):"Not configured";players.textContent=data.players??"—";address.textContent=data.address||"Not configured";consoleEl.textContent=data.message||"Status retrieved.";}catch(e){status.textContent="Unavailable";stateEl.textContent="Unavailable";consoleEl.textContent=e.message;}
-}
-$("#mc-refresh")?.addEventListener("click",loadMinecraft);
-$("#mc-action-form")?.addEventListener("submit",async e=>{e.preventDefault();const result=$("#mc-result");result.textContent="Sending action…";try{const data=await api("/api/minecraft/moderate",{method:"POST",body:JSON.stringify({action:$("#mc-action").value,player:$("#mc-player").value,reason:$("#mc-reason").value})});result.textContent=data.response||"Action sent.";await loadMinecraft();}catch(err){result.textContent=err.message;}});
