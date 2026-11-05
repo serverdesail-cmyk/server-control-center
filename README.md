@@ -145,3 +145,9 @@ sudo docker compose --project-name scc \
 - [FastAPI password hashing guidance](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/)
 - [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
 - [Docker Compose environment interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
+
+## Minecraft moderation integration
+
+The Minecraft page is a separate workspace from the file manager and uses the same SCC login. It connects to a Minecraft Java server through RCON. Enable `enable-rcon=true` and set a strong `rcon.password` in the server's `server.properties`; keep the RCON port private and firewall it so only the SCC host can reach it. Set `SCC_MC_RCON_HOST`, `SCC_MC_RCON_PORT`, and `SCC_MC_RCON_PASSWORD` in the SCC backend environment (the `.env.example` shows the names), then restart SCC. The moderation endpoint is owner-only and supports kick, ban, and pardon. Do not expose RCON directly to the public internet.
+
+For Docker deployments, use the Minecraft server's reachable hostname or LAN address as `SCC_MC_RCON_HOST`; `127.0.0.1` refers to the SCC container itself. Ensure the server's RCON port is reachable from the SCC container without publishing it publicly.
