@@ -10,6 +10,8 @@ import os
 import re
 import secrets
 import shutil
+import socket
+import struct
 import sqlite3
 import stat
 import threading
@@ -94,6 +96,41 @@ class Settings:
     def database_path(self) -> Path:
         return self.data_dir / "scc.sqlite3"
 
+
+
+class MinecraftModerationBody(BaseModel):
+    action: str = Field(pattern="^(kick|ban|pardon)$")
+    player: str = Field(min_length=1, max_length=16, pattern="^[A-Za-z0-9_]+$")
+    reason: str = Field(default="", max_length=160)
+
+def minecraft_rcon(command: str) -> str:
+    host = os.getenv("SCC_MC_RCON_HOST", "").strip()
+    password = os.getenv("SCC_MC_RCON_PASSWORD", "")
+    try: port = int(os.getenv("SCC_MC_RCON_PORT", "25575"))
+    except ValueError: raise HTTPException(status_code=503, detail="Minecraft RCON port is invalid")
+    if not host or not password:
+        raise HTTPException(status_code=503, detail="Minecraft RCON is not configured")
+    def packet(sock, request_id, kind, payload):
+        body = struct.pack("<ii", request_id, kind) + payload.encode("utf-8") + b"\x00\x00"
+        sock.sendall(struct.pack("<i", len(body)) + body)
+        size = struct.unpack("<i", sock.recv(4))[0]
+        data = b""
+        while len(data) < size:
+            chunk = sock.recv(size-len(data))
+            if not chunk: raise OSError("RCON connection closed")
+            data += chunk
+        rid, rtype = struct.unpack("<ii", data[:8])
+        if rid != request_id: raise OSError("Unexpected RCON response")
+        return data[8:-2].decode("utf-8", "replace")
+    try:
+        with socket.create_connection((host, port), timeout=3) as sock:
+            sock.settimeout(3)
+            if packet(sock, 1, 3, password) == "":
+                # Auth packet's body is empty on success in some implementations; verify via command response.
+                pass
+            return packet(sock, 2, 2, command)
+    except (OSError, struct.error) as exc:
+        raise HTTPException(status_code=502, detail=f"Minecraft RCON connection failed: {exc}")
 
 class SetupBody(BaseModel):
     setup_token: str = Field(min_length=24, max_length=256)
@@ -1637,6 +1674,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.commit()
         audit_event(config, user, "folder_grant_deleted", row["path"])
         return {"ok": True}
+
+    @app.get("/api/minecraft/status")
+    async def minecraft_status(_: CurrentUser):
+        configured = bool(os.getenv("SCC_MC_RCON_HOST") and os.getenv("SCC_MC_RCON_PASSWORD"))
+        if not configured:
+            return {"configured": False, "online": False, "address": "", "players": None, "message": "Set SCC_MC_RCON_HOST, SCC_MC_RCON_PORT, and SCC_MC_RCON_PASSWORD to connect."}
+        try:
+            response = minecraft_rcon("list")
+            return {"configured": True, "online": True, "address": f"{os.getenv('SCC_MC_RCON_HOST')}:{os.getenv('SCC_MC_RCON_PORT','25575')}", "players": response, "message": response}
+        except HTTPException as exc:
+            return {"configured": True, "online": False, "address": f"{os.getenv('SCC_MC_RCON_HOST')}:{os.getenv('SCC_MC_RCON_PORT','25575')}", "players": None, "message": exc.detail}
+
+    @app.post("/api/minecraft/moderate")
+    async def minecraft_moderate(body: MinecraftModerationBody, user: CurrentUser):
+        require_owner(user)
+        reason = body.reason.strip()
+        command = body.action + " " + body.player
+        if body.action in {"kick", "ban"} and reason:
+            command += " " + reason
+        response = minecraft_rcon(command)
+        audit_event(config, user, "minecraft_moderation", body.player, body.action)
+        return {"ok": True, "response": response or "Command sent."}
 
     app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="frontend")
     return app
