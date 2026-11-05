@@ -1,4 +1,6 @@
 import ctypes
+import asyncio
+import ipaddress
 import base64
 import binascii
 import errno
@@ -29,12 +31,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.6.0"
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_ATTEMPTS = 8
+LOGIN_IP_MAX_ATTEMPTS = 20
 TEXT_FILE_LIMIT = 1024 * 1024
-UPLOAD_LIMIT = 1024 * 1024 * 1024
+UPLOAD_LIMIT = 50 * 1024 * 1024
+STORAGE_LIMIT = 10 * 1024 * 1024 * 1024
+ENTRY_LIMIT = 100_000
+DEFAULT_REQUEST_LIMIT = 2 * 1024 * 1024
+MULTIPART_OVERHEAD_LIMIT = 256 * 1024
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
 PERMISSIONS = {
@@ -71,6 +78,10 @@ class Settings:
     setup_token: str
     cookie_secure: bool = True
     max_upload_bytes: int = UPLOAD_LIMIT
+    max_storage_bytes: int = STORAGE_LIMIT
+    max_entries: int = ENTRY_LIMIT
+    trusted_proxy_cidrs: str = "172.16.0.0/12,127.0.0.1/32,::1/128"
+    host_data_path: Path = Path("/var/lib/server-control-center/data")
     host_proc_dir: Path = Path("/host/proc")
 
     @classmethod
@@ -81,6 +92,18 @@ class Settings:
             raise RuntimeError("SCC_MAX_UPLOAD_BYTES must be an integer") from exc
         if max_upload < 1:
             raise RuntimeError("SCC_MAX_UPLOAD_BYTES must be positive")
+        try:
+            max_storage = int(os.getenv("SCC_MAX_STORAGE_BYTES", str(STORAGE_LIMIT)))
+        except ValueError as exc:
+            raise RuntimeError("SCC_MAX_STORAGE_BYTES must be an integer") from exc
+        if max_storage < max_upload:
+            raise RuntimeError("SCC_MAX_STORAGE_BYTES must be at least SCC_MAX_UPLOAD_BYTES")
+        try:
+            max_entries = int(os.getenv("SCC_MAX_ENTRIES", str(ENTRY_LIMIT)))
+        except ValueError as exc:
+            raise RuntimeError("SCC_MAX_ENTRIES must be an integer") from exc
+        if max_entries < 1:
+            raise RuntimeError("SCC_MAX_ENTRIES must be positive")
         secure = os.getenv("SCC_COOKIE_SECURE", "true").strip().lower()
         if secure not in {"true", "false"}:
             raise RuntimeError("SCC_COOKIE_SECURE must be true or false")
@@ -90,6 +113,10 @@ class Settings:
             setup_token=os.getenv("SCC_SETUP_TOKEN", ""),
             cookie_secure=secure == "true",
             max_upload_bytes=max_upload,
+            max_storage_bytes=max_storage,
+            max_entries=max_entries,
+            trusted_proxy_cidrs=os.getenv("SCC_TRUSTED_PROXY_CIDRS", "172.16.0.0/12,127.0.0.1/32,::1/128"),
+            host_data_path=Path(os.getenv("SCC_HOST_DATA_PATH", "/var/lib/server-control-center/data")),
         )
 
     @property
@@ -151,6 +178,11 @@ class UserBody(BaseModel):
 
 class UserActiveBody(BaseModel):
     active: bool
+
+
+class QuotaBody(BaseModel):
+    size_gib: float | None = Field(default=None, gt=0, le=1048576)
+    unlimited: bool = False
 
 
 class PasswordBody(BaseModel):
@@ -235,8 +267,22 @@ def initialize(settings: Settings) -> None:
     if not settings.filesystem_root.is_dir():
         raise RuntimeError(f"Filesystem root does not exist: {settings.filesystem_root}")
     base_root = settings.filesystem_root.resolve(strict=True)
-    if base_root == Path("/"):
-        raise RuntimeError("The configured filesystem mount cannot be /")
+    if base_root in {Path("/"), Path("/srv"), Path("/home"), Path("/var"), Path("/etc"), Path("/opt"), Path("/root"), Path("/usr"), Path("/tmp"), Path("/run")}:
+        raise RuntimeError("SCC_FILESYSTEM_ROOT must be a dedicated data directory, not a broad system directory")
+    protected_paths = (
+        Path("/var/lib/server-control-center"),
+        Path("/opt/server-control-center"),
+        Path("/etc/server-control-center"),
+        settings.data_dir.resolve(),
+        settings.host_data_path.resolve(),
+    )
+    for protected in protected_paths:
+        if base_root == protected or base_root.is_relative_to(protected) or protected.is_relative_to(base_root):
+            raise RuntimeError("SCC_FILESYSTEM_ROOT must not overlap SCC's private application or database directories")
+    if os.name == "posix":
+        root_stat = base_root.stat()
+        if root_stat.st_uid != os.geteuid() or stat.S_IMODE(root_stat.st_mode) & 0o022:
+            raise RuntimeError("SCC_FILESYSTEM_ROOT must be owned by the SCC service UID and not be group/world writable")
     with closing(connect(settings.database_path)) as db:
         db.execute("PRAGMA journal_mode = WAL")
         db.executescript(
@@ -276,6 +322,8 @@ def initialize(settings: Settings) -> None:
             );
             CREATE INDEX IF NOT EXISTS login_attempt_lookup
                 ON login_attempts(username, remote_host, attempted_at);
+            CREATE INDEX IF NOT EXISTS login_attempt_remote_lookup
+                ON login_attempts(remote_host, attempted_at);
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -289,6 +337,14 @@ def initialize(settings: Settings) -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS storage_ownership (
+                path TEXT PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                mtime_ns INTEGER NOT NULL DEFAULT 0,
+                known INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         db.execute(
@@ -298,6 +354,12 @@ def initialize(settings: Settings) -> None:
         user_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()
         }
+        if "max_storage_bytes" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN max_storage_bytes INTEGER")
+        db.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('global_storage_limit_bytes', ?)",
+            (str(settings.max_storage_bytes),),
+        )
         if "avatar" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
         db.execute(
@@ -569,6 +631,19 @@ def get_permissions(db: sqlite3.Connection, user: sqlite3.Row, target: str) -> s
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
+def has_descendant_grant(db: sqlite3.Connection, user: sqlite3.Row, target: str) -> bool:
+    if user["role"] == "owner":
+        return True
+    base = target.rstrip("/") if target != "/" else ""
+    escaped_base = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = escaped_base + "/%"
+    row = db.execute(
+        "SELECT 1 FROM grants WHERE user_id = ? AND path LIKE ? ESCAPE '\\' LIMIT 1",
+        (user["id"], pattern),
+    ).fetchone()
+    return row is not None
+
+
 def require_permission(
     db: sqlite3.Connection, user: sqlite3.Row, path: str, permission: str
 ) -> None:
@@ -751,6 +826,180 @@ def range_bounds(header: str | None, size: int) -> tuple[int, int, int]:
     return start, end, 206
 
 
+class BodyTooLarge(Exception):
+    pass
+
+
+class RequestBodyLimitMiddleware:
+    """Bound request bodies before multipart parsing can spool them to disk."""
+
+    def __init__(self, app, upload_limit: int, default_limit: int = DEFAULT_REQUEST_LIMIT):
+        self.app = app
+        self.upload_limit = upload_limit + MULTIPART_OVERHEAD_LIMIT
+        self.default_limit = default_limit
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        limit = self.upload_limit if path == "/api/files/upload" else self.default_limit
+        headers = dict(scope.get("headers", []))
+        raw_length = headers.get(b"content-length")
+        if raw_length:
+            try:
+                if int(raw_length) > limit:
+                    body = b'{"detail":"Request body exceeds the configured limit"}'
+                    await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                    await send({"type": "http.response.body", "body": body})
+                    return
+            except ValueError:
+                body = b'{"detail":"Invalid Content-Length"}'
+                await send({"type": "http.response.start", "status": 400, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise BodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except BodyTooLarge:
+            body = b'{"detail":"Request body exceeds the configured limit"}'
+            await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+
+
+def request_client_ip(request: Request, trusted_proxy_cidrs: str) -> str:
+    peer = request.client.host if request.client else "unknown"
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    trusted = []
+    for value in trusted_proxy_cidrs.split(","):
+        value = value.strip()
+        if value:
+            try:
+                trusted.append(ipaddress.ip_network(value, strict=False))
+            except ValueError:
+                continue
+    if not any(peer_ip in network for network in trusted):
+        return str(peer_ip)
+    forwarded = request.headers.get("x-forwarded-for", "")
+    chain = []
+    for value in forwarded.split(","):
+        try:
+            chain.append(ipaddress.ip_address(value.strip()))
+        except ValueError:
+            return str(peer_ip)
+    # Walk from the proxy-facing end, skipping trusted proxies. The first
+    # untrusted hop is the client; leftmost attacker-supplied values are ignored.
+    for candidate in reversed(chain):
+        if not any(candidate in network for network in trusted):
+            return str(candidate)
+    return str(chain[0]) if chain else str(peer_ip)
+
+def directory_usage(root: Path) -> tuple[int, int]:
+    """Count regular-file bytes and directory entries without following symlinks."""
+    stack = [open_root(root)]
+    total_bytes = 0
+    total_entries = 0
+    try:
+        while stack:
+            directory_fd = stack.pop()
+            try:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        total_entries += 1
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                        except FileNotFoundError:
+                            total_entries -= 1
+                            continue
+                        if stat.S_ISREG(entry_stat.st_mode):
+                            total_bytes += entry_stat.st_size
+                        elif stat.S_ISDIR(entry_stat.st_mode):
+                            try:
+                                child_fd = os.open(entry.name, os.O_RDONLY | DIRECTORY | NOFOLLOW | CLOEXEC, dir_fd=directory_fd)
+                            except FileNotFoundError:
+                                total_entries -= 1
+                                continue
+                            stack.append(child_fd)
+            finally:
+                os.close(directory_fd)
+        return total_bytes, total_entries
+    except OSError as exc:
+        for fd in stack:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise HTTPException(status_code=503, detail="Storage usage cannot be verified safely") from exc
+
+
+def storage_snapshot(settings: Settings, db: sqlite3.Connection) -> dict[str, Any]:
+    root = active_filesystem_root(settings)
+    actual_bytes, entries = directory_usage(root)
+    limit_row = db.execute(
+        "SELECT value FROM app_settings WHERE key='global_storage_limit_bytes'"
+    ).fetchone()
+    limit = int(limit_row["value"]) if limit_row and limit_row["value"] != "unlimited" else None
+    known = db.execute(
+        "SELECT user_id, COALESCE(SUM(size_bytes),0) AS used FROM storage_ownership "
+        "WHERE known=1 GROUP BY user_id"
+    ).fetchall()
+    by_user = {row["user_id"]: int(row["used"]) for row in known if row["user_id"] is not None}
+    unknown = db.execute(
+        "SELECT COALESCE(SUM(size_bytes),0) FROM storage_ownership WHERE known=0 OR user_id IS NULL"
+    ).fetchone()[0]
+    return {"global_limit_bytes": limit, "used_bytes": actual_bytes,
+            "remaining_bytes": None if limit is None else max(0, limit-actual_bytes),
+            "utilization_percent": None if not limit else round(actual_bytes*100/limit, 2),
+            "entries": entries, "unknown_attributed_bytes": int(unknown or 0),
+            "user_usage": by_user}
+
+
+def reconcile_storage(settings: Settings, db: sqlite3.Connection) -> dict[str, int]:
+    root = active_filesystem_root(settings)
+    seen: set[str] = set()
+    known = db.execute("SELECT path,user_id FROM storage_ownership WHERE known=1").fetchall()
+    owner_by_path = {row["path"]: row["user_id"] for row in known}
+    total = unknown = files = 0
+    for base, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if not (Path(base)/d).is_symlink()]
+        for name in names:
+            path = Path(base)/name
+            try:
+                st = path.lstat()
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                rel = "/" + path.relative_to(root).as_posix()
+                seen.add(rel); files += 1; total += st.st_size
+                uid = owner_by_path.get(rel)
+                if uid is None: unknown += st.st_size
+                db.execute(
+                    "INSERT INTO storage_ownership(path,user_id,size_bytes,mtime_ns,known,updated_at) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                    "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,updated_at=excluded.updated_at",
+                    (rel, uid, st.st_size, st.st_mtime_ns, 1 if uid is not None else 0, now()))
+            except OSError:
+                continue
+    existing = [r["path"] for r in db.execute("SELECT path FROM storage_ownership").fetchall()]
+    for rel in existing:
+        if rel not in seen:
+            db.execute("DELETE FROM storage_ownership WHERE path=?", (rel,))
+    db.commit()
+    return {"files": files, "used_bytes": total, "unknown_bytes": unknown}
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings.from_env()
 
@@ -771,6 +1020,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.started_at = time.time()
     app.state.host_metrics_sample = None
     app.state.host_metrics_lock = threading.Lock()
+    app.state.upload_lock = asyncio.Lock()
+    app.add_middleware(RequestBodyLimitMiddleware, upload_limit=config.max_upload_bytes)
     app.mount("/assets", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 
     def current_user(request: Request) -> sqlite3.Row:
@@ -872,9 +1123,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not request_origin_matches(request):
             raise HTTPException(status_code=403, detail="Invalid request origin")
         username = body.username.strip()
-        remote_host = request.client.host if request.client else "unknown"
+        remote_host = request_client_ip(request, config.trusted_proxy_cidrs)
         current_time = now()
         with closing(connect(config.database_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (current_time - LOGIN_WINDOW_SECONDS,))
             attempts = db.execute(
                 """
@@ -883,7 +1135,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 """,
                 (username, remote_host, current_time - LOGIN_WINDOW_SECONDS),
             ).fetchone()["count"]
-            if attempts >= LOGIN_MAX_ATTEMPTS:
+            ip_attempts = db.execute(
+                "SELECT COUNT(*) AS count FROM login_attempts WHERE remote_host = ? AND attempted_at >= ?",
+                (remote_host, current_time - LOGIN_WINDOW_SECONDS),
+            ).fetchone()["count"]
+            if attempts >= LOGIN_MAX_ATTEMPTS or ip_attempts >= LOGIN_IP_MAX_ATTEMPTS:
+                db.commit()
                 raise HTTPException(status_code=429, detail="Too many login attempts; try again later")
             user = db.execute(
                 "SELECT id, username, password_hash, role, active FROM users WHERE username = ? COLLATE NOCASE",
@@ -1197,7 +1454,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = virtual_path(parts)
         filesystem_root = active_filesystem_root(config)
         with closing(connect(config.database_path)) as db:
-            require_permission(db, user, target, "browse")
+            current_permissions = get_permissions(db, user, target)
+            if "browse" not in current_permissions and not has_descendant_grant(db, user, target):
+                raise HTTPException(status_code=403, detail="Folder permission denied")
             fd = open_directory(filesystem_root, parts)
             try:
                 items = []
@@ -1207,15 +1466,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             item_stat = entry.stat(follow_symlinks=False)
                         except FileNotFoundError:
                             continue
-                        item = file_metadata(entry.name, item_stat)
                         item_path = virtual_path(parts + (entry.name,))
-                        item["access"] = sorted(get_permissions(db, user, item_path))
+                        item_permissions = get_permissions(db, user, item_path)
+                        is_directory = stat.S_ISDIR(item_stat.st_mode)
+                        # Reveal only directly granted entries, plus directory ancestors
+                        # needed to navigate to a more-specific nested grant.
+                        restricted_ancestor = (
+                            user["role"] != "owner"
+                            and not item_permissions
+                            and is_directory
+                            and has_descendant_grant(db, user, item_path)
+                        )
+                        if user["role"] != "owner" and not item_permissions and not restricted_ancestor:
+                            continue
+                        if restricted_ancestor:
+                            # Expose only the folder name and type needed to reach a
+                            # more-specific grant; do not leak its metadata or ownership.
+                            item = {
+                                "name": entry.name,
+                                "kind": "folder",
+                                "size": 0,
+                                "modified": None,
+                                "permissions": None,
+                                "mode": None,
+                                "uid": None,
+                                "gid": None,
+                                "restricted_ancestor": True,
+                            }
+                        else:
+                            item = file_metadata(entry.name, item_stat)
+                            item["restricted_ancestor"] = False
+                        item["access"] = sorted(item_permissions)
                         items.append(item)
                 items.sort(key=lambda item: (item["kind"] != "folder", item["name"].casefold()))
                 return {
                     "path": target,
                     "items": items,
-                    "permissions": sorted(get_permissions(db, user, target)),
+                    "permissions": sorted(current_permissions),
                 }
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
@@ -1338,15 +1625,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         parent_path = virtual_path(parent_parts)
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, parent_path, "create")
-        fd = open_directory(active_filesystem_root(config), parent_parts)
-        try:
-            os.mkdir(body.name, mode=0o700, dir_fd=fd)
-        except FileExistsError as exc:
-            raise HTTPException(status_code=409, detail="A file with that name already exists") from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
-        finally:
-            os.close(fd)
+        async with app.state.upload_lock:
+            _, entry_count = await asyncio.to_thread(directory_usage, config.filesystem_root.resolve(strict=True))
+            if entry_count >= config.max_entries:
+                raise HTTPException(status_code=413, detail="SCC storage entry limit has been reached")
+            fd = open_directory(active_filesystem_root(config), parent_parts)
+            try:
+                os.mkdir(body.name, mode=0o700, dir_fd=fd)
+            except FileExistsError as exc:
+                raise HTTPException(status_code=409, detail="A file with that name already exists") from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
+            finally:
+                os.close(fd)
         target = virtual_path(parent_parts + (body.name,))
         audit_event(config, user, "folder_created", target)
         return {"path": target}
@@ -1363,26 +1654,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = body.content.encode("utf-8")
         if len(data) > TEXT_FILE_LIMIT:
             raise HTTPException(status_code=413, detail="Text content exceeds the file limit")
-        parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
-        try:
-            fd = os.open(
-                parts[-1],
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
-                0o600,
-                dir_fd=parent_fd,
-            )
+        async with app.state.upload_lock:
+            _, entry_count = await asyncio.to_thread(directory_usage, config.filesystem_root.resolve(strict=True))
+            if entry_count >= config.max_entries:
+                raise HTTPException(status_code=413, detail="SCC storage entry limit has been reached")
+            parent_fd = open_directory(active_filesystem_root(config), parts[:-1])
             try:
-                offset = 0
-                while offset < len(data):
-                    offset += os.write(fd, data[offset:])
+                fd = os.open(
+                    parts[-1],
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    offset = 0
+                    while offset < len(data):
+                        offset += os.write(fd, data[offset:])
+                finally:
+                    os.close(fd)
+            except FileExistsError as exc:
+                raise HTTPException(status_code=409, detail="A file with that name already exists") from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
             finally:
-                os.close(fd)
-        except FileExistsError as exc:
-            raise HTTPException(status_code=409, detail="A file with that name already exists") from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
-        finally:
-            os.close(parent_fd)
+                os.close(parent_fd)
         audit_event(config, user, "file_created", target)
         return {"path": target}
 
@@ -1490,54 +1785,122 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         check_filename(file.filename or "")
         with closing(connect(config.database_path)) as db:
             require_permission(db, user, target, "upload")
-        parent_fd = open_directory(active_filesystem_root(config), parts)
-        temporary_name = f".scc-upload-{secrets.token_hex(16)}"
-        temporary_fd: int | None = None
-        total = 0
-        try:
-            temporary_fd = os.open(
-                temporary_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
-                0o600,
-                dir_fd=parent_fd,
-            )
-            while True:
-                block = await file.read(UPLOAD_CHUNK_SIZE)
-                if not block:
-                    break
-                total += len(block)
-                if total > config.max_upload_bytes:
-                    raise HTTPException(status_code=413, detail="Upload exceeds the configured limit")
-                offset = 0
-                while offset < len(block):
-                    offset += os.write(temporary_fd, block[offset:])
-            os.fsync(temporary_fd)
-            os.close(temporary_fd)
-            temporary_fd = None
-            with closing(connect(config.database_path)) as db:
-                require_permission(db, user, target, "upload")
-            rename_without_replace(parent_fd, temporary_name, parent_fd, file.filename)
-        except Exception:
-            if temporary_fd is not None:
-                os.close(temporary_fd)
+        async with app.state.upload_lock:
+            filesystem_root = config.filesystem_root.resolve(strict=True)
+            active_root = active_filesystem_root(config)
+            current_bytes, current_entries = await asyncio.to_thread(directory_usage, filesystem_root)
+            if current_bytes >= config.max_storage_bytes:
+                raise HTTPException(status_code=413, detail="SCC storage quota has been reached")
+            if current_entries >= config.max_entries:
+                raise HTTPException(status_code=413, detail="SCC storage entry limit has been reached")
+            parent_fd = open_directory(active_root, parts)
+            temporary_name = f".scc-upload-{secrets.token_hex(16)}"
+            temporary_fd: int | None = None
+            total = 0
             try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            raise
-        finally:
-            os.close(parent_fd)
-            await file.close()
-        result_path = virtual_path(parts + (file.filename,))
-        audit_event(config, user, "file_uploaded", result_path, str(total))
-        return {"path": result_path, "size": total}
+                temporary_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                while True:
+                    block = await file.read(UPLOAD_CHUNK_SIZE)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > config.max_upload_bytes:
+                        raise HTTPException(status_code=413, detail="Upload exceeds the configured limit")
+                    offset = 0
+                    while offset < len(block):
+                        offset += os.write(temporary_fd, block[offset:])
+                os.fsync(temporary_fd)
+                os.close(temporary_fd)
+                temporary_fd = None
+                with closing(connect(config.database_path)) as db:
+                    require_permission(db, user, target, "upload")
+                    final_bytes, final_entries = await asyncio.to_thread(directory_usage, filesystem_root)
+                    if final_bytes > config.max_storage_bytes:
+                        raise HTTPException(status_code=413, detail="SCC storage quota would be exceeded")
+                    if final_entries > config.max_entries:
+                        raise HTTPException(status_code=413, detail="SCC storage entry limit would be exceeded")
+                rename_without_replace(parent_fd, temporary_name, parent_fd, file.filename)
+            except Exception:
+                if temporary_fd is not None:
+                    os.close(temporary_fd)
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            finally:
+                os.close(parent_fd)
+                await file.close()
+            result_path = virtual_path(parts + (file.filename,))
+            audit_event(config, user, "file_uploaded", result_path, str(total))
+            return {"path": result_path, "size": total}
+    @app.get("/api/storage")
+    async def storage_status(user: CurrentUser):
+        with closing(connect(config.database_path)) as db:
+            snapshot = storage_snapshot(config, db)
+            if user["role"] == "owner":
+                users = db.execute("SELECT id,username,max_storage_bytes FROM users ORDER BY username").fetchall()
+                snapshot["users"] = [{
+                    "id": row["id"], "username": row["username"],
+                    "limit_bytes": row["max_storage_bytes"],
+                    "used_bytes": snapshot["user_usage"].get(row["id"], 0)
+                } for row in users]
+            else:
+                snapshot.pop("user_usage", None)
+                snapshot.pop("unknown_attributed_bytes", None)
+            return snapshot
+
+    @app.put("/api/storage/global")
+    async def set_global_storage_quota(body: QuotaBody, user: CurrentUser):
+        require_owner(user)
+        value = "unlimited" if body.unlimited else str(int(body.size_gib * 1024**3)) if body.size_gib else None
+        if value is None:
+            raise HTTPException(status_code=422, detail="Specify a positive GiB size or unlimited=true")
+        async with app.state.upload_lock:
+            with closing(connect(config.database_path)) as db:
+                db.execute("UPDATE app_settings SET value=? WHERE key='global_storage_limit_bytes'", (value,))
+                db.commit()
+        audit_event(config, user, "global_storage_quota_changed", None, value)
+        return {"limit_bytes": None if value == "unlimited" else int(value)}
+
+    @app.put("/api/storage/users/{user_id}")
+    async def set_user_storage_quota(user_id: int, body: QuotaBody, user: CurrentUser):
+        require_owner(user)
+        value = None if body.unlimited else int(body.size_gib * 1024**3) if body.size_gib else -1
+        with closing(connect(config.database_path)) as db:
+            global_row = db.execute("SELECT value FROM app_settings WHERE key='global_storage_limit_bytes'").fetchone()
+            global_limit = int(global_row["value"]) if global_row and global_row["value"] != "unlimited" else None
+            if value == -1:
+                raise HTTPException(status_code=422, detail="Specify a positive GiB size or unlimited=true")
+            if value is not None and global_limit is not None and value > global_limit:
+                raise HTTPException(status_code=422, detail="User quota cannot exceed the global SCC limit")
+            result = db.execute("UPDATE users SET max_storage_bytes=? WHERE id=?", (value, user_id))
+            if result.rowcount != 1:
+                raise HTTPException(status_code=404, detail="User not found")
+            db.commit()
+        audit_event(config, user, "user_storage_quota_changed", str(user_id), "unlimited" if value is None else str(value))
+        return {"user_id": user_id, "limit_bytes": value}
+
+    @app.post("/api/storage/reconcile")
+    async def storage_reconcile(user: CurrentUser):
+        require_owner(user)
+        async with app.state.upload_lock:
+            with closing(connect(config.database_path)) as db:
+                result = reconcile_storage(config, db)
+        audit_event(config, user, "storage_reconciled", None, json.dumps(result))
+        return result
 
     @app.get("/api/users")
     async def list_users(user: CurrentUser):
         require_owner(user)
         with closing(connect(config.database_path)) as db:
             users = db.execute(
-                "SELECT id, username, role, active, created_at FROM users ORDER BY id"
+                "SELECT id, username, role, active, created_at, max_storage_bytes FROM users ORDER BY id"
             ).fetchall()
         return [
             {
@@ -1546,6 +1909,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "role": item["role"],
                 "active": bool(item["active"]),
                 "created_at": item["created_at"],
+                "max_storage_bytes": item["max_storage_bytes"],
             }
             for item in users
         ]
