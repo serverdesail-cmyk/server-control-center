@@ -937,7 +937,7 @@ function makeFileRow(item) {
   size.textContent = item.kind === "folder" ? "—" : formatBytes(item.size);
   const modified = document.createElement("span");
   modified.className = "muted";
-  modified.textContent = new Date(item.modified).toLocaleString();
+  modified.textContent = item.restricted_ancestor ? "—" : new Date(item.modified).toLocaleString();
   const actions = document.createElement("div");
   actions.className = "file-actions";
   const menu = document.createElement("details");
@@ -956,7 +956,7 @@ function makeFileRow(item) {
   menu.append(trigger, menuItems);
   actions.append(menu);
 
-  addAction(menuItems, "ⓘ", "Details", () => toast(`${item.permissions} · UID ${item.uid} · GID ${item.gid} · ${formatBytes(item.size)}`));
+  if (!item.restricted_ancestor) addAction(menuItems, "ⓘ", "Details", () => toast(`${item.permissions} · UID ${item.uid} · GID ${item.gid} · ${formatBytes(item.size)}`));
   if (item.kind === "file" && item.access.includes("download")) addAction(menuItems, "↓", "Download", () => downloadFile(item));
   if (item.kind === "file" && item.access.includes("read")) {
     const canEdit = item.access.includes("edit");
@@ -1444,11 +1444,23 @@ function renderUsers(users) {
     select.append(option);
   }
   updateGrantScope();
+  const quotaTools = document.createElement("div");
+  quotaTools.className = "admin-actions";
+  const globalQuota = document.createElement("button");
+  globalQuota.className = "text-button";
+  globalQuota.textContent = "Configure global storage limit";
+  globalQuota.addEventListener("click", configureGlobalQuota);
+  const reconcile = document.createElement("button");
+  reconcile.className = "text-button";
+  reconcile.textContent = "Reconcile storage";
+  reconcile.addEventListener("click", reconcileStorage);
+  quotaTools.append(globalQuota, reconcile);
+  container.append(quotaTools);
   const table = document.createElement("table");
   table.className = "admin-table";
   const head = document.createElement("thead");
   const headerRow = document.createElement("tr");
-  for (const label of ["Account", "Role", "State", "Actions"]) {
+  for (const label of ["Account", "Role", "State", "Storage quota", "Actions"]) {
     const cell = document.createElement("th");
     cell.textContent = label;
     headerRow.append(cell);
@@ -1466,8 +1478,15 @@ function renderUsers(users) {
     role.append(pill);
     const active = document.createElement("td");
     active.textContent = user.active ? "Active" : "Disabled";
+    const quota = document.createElement("td");
+    quota.textContent = user.max_storage_bytes == null ? "Unlimited" : `${(user.max_storage_bytes / 1073741824).toFixed(2)} GiB`;
     const actions = document.createElement("td");
     if (user.role !== "owner") {
+      const setQuota = document.createElement("button");
+      setQuota.className = "text-button";
+      setQuota.textContent = "Set quota";
+      setQuota.addEventListener("click", () => configureUserQuota(user));
+      actions.append(setQuota, document.createTextNode(" · "));
       const toggle = document.createElement("button");
       toggle.className = "text-button";
       toggle.textContent = user.active ? "Disable" : "Enable";
@@ -1482,11 +1501,42 @@ function renderUsers(users) {
       remove.addEventListener("click", () => deleteUser(user));
       actions.append(toggle, document.createTextNode(" · "), reset, document.createTextNode(" · "), remove);
     } else actions.textContent = "Protected";
-    row.append(name, role, active, actions);
+    row.append(name, role, active, quota, actions);
     body.append(row);
   }
   table.append(head, body);
   container.append(table);
+}
+
+async function configureGlobalQuota() {
+  const raw = prompt("Global SCC storage limit in GiB. Enter 'unlimited' to remove the configured cap:");
+  if (raw === null) return;
+  try {
+    const unlimited = raw.trim().toLowerCase() === "unlimited";
+    const size = unlimited ? null : Number(raw);
+    if (!unlimited && (!Number.isFinite(size) || size <= 0)) throw new Error("Enter a positive GiB value or 'unlimited'.");
+    await api("/api/storage/global", { method: "PUT", body: JSON.stringify({ size_gib: size, unlimited }) });
+    toast("Global storage limit updated.");
+  } catch (error) { toast(error.message, true); }
+}
+async function configureUserQuota(user) {
+  const raw = prompt(`Storage limit for ${user.username} in GiB. Enter 'unlimited' for no individual cap:`);
+  if (raw === null) return;
+  try {
+    const unlimited = raw.trim().toLowerCase() === "unlimited";
+    const size = unlimited ? null : Number(raw);
+    if (!unlimited && (!Number.isFinite(size) || size <= 0)) throw new Error("Enter a positive GiB value or 'unlimited'.");
+    await api(`/api/storage/users/${user.id}`, { method: "PUT", body: JSON.stringify({ size_gib: size, unlimited }) });
+    toast(`Quota updated for ${user.username}.`);
+    await loadAdmin();
+  } catch (error) { toast(error.message, true); }
+}
+async function reconcileStorage() {
+  if (!confirm("Scan the managed filesystem and reconcile recorded file sizes? Existing unknown files will remain unassigned.")) return;
+  try {
+    const result = await api("/api/storage/reconcile", { method: "POST" });
+    toast(`Reconciled ${result.files} files; unknown ownership: ${result.unknown_bytes} bytes.`);
+  } catch (error) { toast(error.message, true); }
 }
 
 async function setUserActive(user, active) {
