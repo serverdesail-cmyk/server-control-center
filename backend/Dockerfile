@@ -8,5 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --requirement requirements.txt
 COPY app ./app
 
+USER 65532:65532
+
 EXPOSE 8787
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787", "--no-proxy-headers"]
