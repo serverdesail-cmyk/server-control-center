@@ -156,7 +156,9 @@ function showApp(user) {
   loadDashboardPreferences();
   loadProfile();
   recordClientActivity("session_started");
-  navigate("dashboard");
+  const requestedSection = new URLSearchParams(window.location.search).get("section");
+  const allowedSections = ["dashboard", "files", "monitoring", "logs"];
+  navigate(allowedSections.includes(requestedSection) ? requestedSection : "dashboard");
   loadDashboard();
   startMetricsPolling();
   startActivityPolling();
@@ -178,7 +180,19 @@ async function bootstrap() {
 function navigate(view) {
   const previousView = state.activeView;
   state.activeView = view;
-  $$(".view").forEach((element) => { element.hidden = element.id !== `${view}-view`; });
+  $$(".view").forEach((element) => {
+    const shouldShow = element.id === `${view}-view`;
+    if (shouldShow && element.hidden) {
+      element.hidden = false;
+      element.classList.remove("view-enter");
+      // Restart the entrance animation on every section change.
+      void element.offsetWidth;
+      element.classList.add("view-enter");
+    } else if (!shouldShow) {
+      element.hidden = true;
+      element.classList.remove("view-enter");
+    }
+  });
   $$(".nav-item").forEach((element) => element.classList.toggle("active", element.dataset.nav === view));
   const titles = {
     dashboard: ["SERVER OVERVIEW", "Overview"],
@@ -581,6 +595,23 @@ async function loadMetrics() {
     $("#monitor-cpu-ring").style.setProperty("--progress", `${cpu ?? 0}%`);
     $("#monitor-cpu-ring-value").textContent = cpu === null ? "—" : `${cpu.toFixed(0)}%`;
     $("#monitor-load").textContent = `Load average · ${data.load_average.map((value) => value.toFixed(2)).join(" / ")}`;
+    const thermal = data.temperature || { available: false };
+    if (thermal.available && Number.isFinite(thermal.celsius)) {
+      const temp = thermal.celsius;
+      const thermalPct = Math.max(0, Math.min(100, temp / 100 * 100));
+      const status = temp >= 90 ? "Critical temperature" : temp >= 75 ? "Warm" : "Normal";
+      $("#monitor-thermal").textContent = `${temp.toFixed(1)} °C`;
+      $("#monitor-thermal-detail").textContent = `${thermal.label || "Host sensor"} · ${status}`;
+      $("#monitor-thermal-meter").style.width = `${thermalPct}%`;
+      $("#monitor-thermal-ring").style.setProperty("--progress", `${thermalPct}%`);
+      $("#monitor-thermal-ring-value").textContent = `${temp.toFixed(0)}°`;
+    } else {
+      $("#monitor-thermal").textContent = "Unavailable";
+      $("#monitor-thermal-detail").textContent = "No readable Linux temperature sensor was found";
+      $("#monitor-thermal-meter").style.width = "0%";
+      $("#monitor-thermal-ring").style.setProperty("--progress", "0%");
+      $("#monitor-thermal-ring-value").textContent = "—";
+    }
 
     const memoryPercent = percentage(data.memory.used, data.memory.total);
     setProgressRing("#memory-ring", "#memory-ring-value", memoryPercent, `${memoryPercent.toFixed(0)}%`);
