@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: scc-server-control-center:0.4.0
+    image: scc-server-control-center:0.6.0
     container_name: server-control-center
     init: true
     restart: unless-stopped
@@ -11,9 +11,13 @@ services:
     environment:
       SCC_DATA_DIR: /data
       SCC_FILESYSTEM_ROOT: "${SCC_HOST_ROOT:?Set SCC_HOST_ROOT}"
+      SCC_HOST_DATA_PATH: "${SCC_DATA_PATH:-/var/lib/server-control-center/data}"
       SCC_SETUP_TOKEN: "${SCC_SETUP_TOKEN:-}"
       SCC_COOKIE_SECURE: "${SCC_COOKIE_SECURE:-true}"
-      SCC_MAX_UPLOAD_BYTES: "${SCC_MAX_UPLOAD_BYTES:-1073741824}"
+      SCC_MAX_UPLOAD_BYTES: "${SCC_MAX_UPLOAD_BYTES:-52428800}"
+      SCC_MAX_STORAGE_BYTES: "${SCC_MAX_STORAGE_BYTES:-10737418240}"
+      SCC_MAX_ENTRIES: "${SCC_MAX_ENTRIES:-100000}"
+      SCC_TRUSTED_PROXY_CIDRS: "${SCC_TRUSTED_PROXY_CIDRS:-172.16.0.0/12,127.0.0.1/32,::1/128}"
     ports:
       - "${SCC_BIND_ADDRESS:-127.0.0.1}:${SCC_PORT:-8787}:8787"
     volumes:
@@ -31,10 +35,19 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
+    pids_limit: 96
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
     mem_limit: 768m
     cpus: 1.5
     stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test:
         - CMD

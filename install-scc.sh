@@ -6,6 +6,9 @@ readonly INSTALL_DIR="/opt/server-control-center"
 readonly LEGACY_INSTALL_DIR="/etc/server-control-center"
 readonly STATE_DIR="/var/lib/server-control-center"
 readonly DATA_DIR="${STATE_DIR}/data"
+readonly SERVICE_USER="scc"
+readonly SERVICE_GROUP="scc"
+readonly DEFAULT_FILES_DIR="/srv/server-control-center-files"
 readonly WRAPPER="/usr/local/bin/scc"
 
 log() { printf '[scc-install] %s\n' "$*"; }
@@ -39,8 +42,6 @@ fi
 if ! getent passwd "${SUDO_UID}" >/dev/null 2>&1; then
   fail "Could not resolve the invoking user ID ${SUDO_UID}."
 fi
-SCC_UID="${SUDO_UID}"
-SCC_GID="${SUDO_GID:-$(id -g "$(getent passwd "${SCC_UID}" | cut -d: -f1)")}"
 
 packages=()
 command -v docker >/dev/null 2>&1 || packages+=(docker)
@@ -59,6 +60,22 @@ command -v git >/dev/null 2>&1 || fail "Git is required to fetch and update SCC.
 command -v tar >/dev/null 2>&1 || fail "tar is required to refresh the SCC installation."
 command -v curl >/dev/null 2>&1 || fail "curl is required for SCC health checks."
 command -v openssl >/dev/null 2>&1 || fail "OpenSSL is required to generate the one-time setup token."
+command -v groupadd >/dev/null 2>&1 || fail "groupadd is required to create the dedicated SCC account."
+command -v useradd >/dev/null 2>&1 || fail "useradd is required to create the dedicated SCC account."
+
+if ! getent group "${SERVICE_GROUP}" >/dev/null 2>&1; then
+  groupadd --system "${SERVICE_GROUP}" || fail "Could not create the dedicated SCC group."
+fi
+if ! getent passwd "${SERVICE_USER}" >/dev/null 2>&1; then
+  useradd --system --gid "${SERVICE_GROUP}" --home-dir "${STATE_DIR}" --no-create-home --shell /usr/bin/nologin "${SERVICE_USER}" || fail "Could not create the dedicated SCC service account."
+fi
+SCC_UID="$(id -u "${SERVICE_USER}")"
+SCC_GID="$(id -g "${SERVICE_USER}")"
+[[ "${SCC_UID}" -ne 0 ]] || fail "The dedicated SCC account must not have UID 0."
+service_group="$(id -gn "${SERVICE_USER}")"
+[[ "${service_group}" == "${SERVICE_GROUP}" ]] || fail "The scc account must use the dedicated scc primary group."
+service_shell="$(getent passwd "${SERVICE_USER}" | cut -d: -f7)"
+[[ "${service_shell}" == "/usr/bin/nologin" || "${service_shell}" == "/sbin/nologin" ]] || fail "The scc account must have a non-login shell (found: ${service_shell})."
 
 if ! docker info >/dev/null 2>&1; then
   if ! systemctl enable --now docker.service; then
@@ -137,13 +154,13 @@ compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[
 bash -n "${INSTALL_DIR}/install-scc.sh" || fail "The repaired installer failed Bash syntax validation."
 bash -n "${INSTALL_DIR}/management/scc" || fail "The repaired management command failed Bash syntax validation."
 
-host_root="/srv"
+host_root="${DEFAULT_FILES_DIR}"
 if [[ -f "${env_file}" ]]; then
   configured_root="$(sed -n 's/^SCC_HOST_ROOT=//p' "${env_file}" | tail -n 1)"
   [[ -n "${configured_root}" ]] && host_root="${configured_root}"
 else
   if [[ ! -d "${host_root}" ]]; then
-    install -d -m 0755 "${host_root}"
+    install -d -o "${SCC_UID}" -g "${SCC_GID}" -m 0750 "${host_root}"
   fi
   setup_token="$(openssl rand -hex 32)"
   cat >"${env_file}" <<EOF
@@ -155,7 +172,10 @@ SCC_BIND_ADDRESS=127.0.0.1
 SCC_PORT=8787
 SCC_COOKIE_SECURE=true
 SCC_SETUP_TOKEN=${setup_token}
-SCC_MAX_UPLOAD_BYTES=1073741824
+SCC_MAX_UPLOAD_BYTES=52428800
+SCC_MAX_STORAGE_BYTES=10737418240
+SCC_MAX_ENTRIES=100000
+SCC_TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
 EOF
   chmod 0600 "${env_file}"
 fi
@@ -166,6 +186,17 @@ fi
 [[ -d "${host_root}" ]] || fail "Configured SCC_HOST_ROOT does not exist: ${host_root}. Create it or correct ${env_file}."
 resolved_root="$(realpath -e "${host_root}")"
 [[ "${resolved_root}" != "/" ]] || fail "SCC_HOST_ROOT must not resolve to /."
+case "${resolved_root}" in
+  /srv|/home|/var|/etc|/opt|/root|/usr|/tmp|/run)
+    fail "Resolved SCC_HOST_ROOT=${resolved_root} is a broad system directory; use a dedicated subdirectory."
+    ;;
+esac
+for protected_path in "${STATE_DIR}" "${INSTALL_DIR}" "${LEGACY_INSTALL_DIR}"; do
+  protected_resolved="$(realpath -m "${protected_path}")"
+  if [[ "${resolved_root}" == "${protected_resolved}" || "${resolved_root}" == "${protected_resolved}/"* || "${protected_resolved}" == "${resolved_root}/"* ]]; then
+    fail "SCC_HOST_ROOT overlaps SCC's private application/state path ${protected_resolved}; choose a separate dedicated storage directory."
+  fi
+done
 
 if [[ "${resolved_root}" != "${host_root}" ]]; then
   escaped_root="$(printf '%s' "${resolved_root}" | sed 's/[&|]/\\&/g')"
@@ -188,10 +219,56 @@ ensure_env_default SCC_DATA_PATH "${DATA_DIR}"
 ensure_env_default SCC_BIND_ADDRESS "127.0.0.1"
 ensure_env_default SCC_PORT "8787"
 ensure_env_default SCC_COOKIE_SECURE "true"
-ensure_env_default SCC_MAX_UPLOAD_BYTES "1073741824"
-chmod 0600 "${env_file}"
+ensure_env_default SCC_MAX_UPLOAD_BYTES "52428800"
+ensure_env_default SCC_MAX_STORAGE_BYTES "10737418240"
+ensure_env_default SCC_MAX_ENTRIES "100000"
+ensure_env_default SCC_TRUSTED_PROXY_CIDRS "172.16.0.0/12,127.0.0.1/32,::1/128"
 
-install -d -o "${SCC_UID}" -g "${SCC_GID}" -m 0700 "${STATE_DIR}" "${DATA_DIR}"
+set_env_value() {
+  local key="$1" value="$2"
+  if grep -q "^${key}=" "${env_file}"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "${env_file}"
+  else
+    printf '%s=%s\n' "${key}" "${value}" >>"${env_file}"
+  fi
+}
+# Migrate the previous shipped 1 GiB default to the safer 50 MiB default;
+# preserve values that an administrator explicitly customized.
+if grep -qx 'SCC_MAX_UPLOAD_BYTES=1073741824' "${env_file}"; then
+  set_env_value SCC_MAX_UPLOAD_BYTES "52428800"
+fi
+data_path="$(sed -n 's/^SCC_DATA_PATH=//p' "${env_file}" | tail -n 1)"
+[[ -n "${data_path}" && "${data_path}" == /* ]] || fail "SCC_DATA_PATH must be an absolute path."
+[[ "${data_path}" != *:* && "${data_path}" != *$'\n'* && "${data_path}" != *'"'* && "${data_path}" != *'$'* && "${data_path}" != *'\'* ]] || fail "SCC_DATA_PATH contains characters unsupported by Docker Compose."
+[[ ! -L "${data_path}" ]] || fail "SCC_DATA_PATH must not be a symbolic link."
+resolved_data_path="$(realpath -m "${data_path}")"
+resolved_state_dir="$(realpath -m "${STATE_DIR}")"
+[[ "${resolved_data_path}" == "${resolved_state_dir}/"* ]] || fail "SCC_DATA_PATH must remain inside ${STATE_DIR}."
+
+# Never mount a broad system directory into the application. The dedicated
+# service account must own and be able to access only this storage boundary.
+case "${host_root}" in
+  /|/srv|/home|/var|/etc|/opt|/root|/usr|/tmp|/run)
+    fail "SCC_HOST_ROOT=${host_root} is too broad. Move only SCC-managed files into ${DEFAULT_FILES_DIR}, set SCC_HOST_ROOT to that dedicated directory in ${env_file}, and rerun the installer."
+    ;;
+esac
+if [[ ! -d "${host_root}" ]]; then
+  install -d -o "${SCC_UID}" -g "${SCC_GID}" -m 0750 "${host_root}"
+fi
+root_owner="$(stat -c '%u' "${host_root}")"
+[[ "${root_owner}" == "${SCC_UID}" ]] || fail "${host_root} must be owned by the dedicated scc account (UID ${SCC_UID}). Review and migrate only SCC-managed files, then set ownership of this dedicated directory; do not recursively chown unrelated data."
+if ! runuser -u "${SERVICE_USER}" -- test -r "${host_root}" -a -w "${host_root}" -a -x "${host_root}"; then
+  fail "The dedicated scc account cannot read/write ${host_root}. Review permissions of this directory and its intended contents."
+fi
+[[ ! -L "${STATE_DIR}" ]] || fail "${STATE_DIR} must not be a symbolic link."
+[[ ! -L "${DATA_DIR}" ]] || fail "${DATA_DIR} must not be a symbolic link."
+install -d -o "${SCC_UID}" -g "${SCC_GID}" -m 0700 "${STATE_DIR}" "${resolved_data_path}"
+chown -R --no-dereference "${SCC_UID}:${SCC_GID}" "${STATE_DIR}"
+chmod 0700 "${STATE_DIR}" "${resolved_data_path}"
+set_env_value SCC_UID "${SCC_UID}"
+set_env_value SCC_GID "${SCC_GID}"
+set_env_value SCC_DATA_PATH "${resolved_data_path}"
+chmod 0600 "${env_file}"
 install -d -m 0755 /usr/local/bin
 cat >"${WRAPPER}" <<'EOF'
 #!/usr/bin/env bash
