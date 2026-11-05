@@ -172,6 +172,10 @@ function roleLabel(role) {
 async function bootstrap() {
   try {
     const user = await api("/api/auth/me");
+    if (window.location.pathname === "/login") {
+      window.location.replace("/services");
+      return;
+    }
     showApp(user);
   } catch {
     showAuth();
@@ -1777,7 +1781,7 @@ $("#auth-form").addEventListener("submit", async (event) => {
         })
       : await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
     toast(setup ? "Root_user account created." : "Signed in.");
-    showApp(user);
+    window.location.assign("/services");
   } catch (error) { toast(error.message, true); }
 });
 
