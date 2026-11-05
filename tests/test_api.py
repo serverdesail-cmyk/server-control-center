@@ -103,10 +103,24 @@ def grant(
     assert response.status_code == 200, response.text
 
 
+def test_filesystem_root_cannot_overlap_private_database_directory(tmp_path: Path) -> None:
+    root = tmp_path / "shared-root"
+    root.mkdir()
+    settings = Settings(
+        data_dir=root / "private-db",
+        filesystem_root=root,
+        setup_token=SETUP_TOKEN,
+        cookie_secure=False,
+    )
+    with pytest.raises(RuntimeError, match="private application or database directories"):
+        with TestClient(create_app(settings)):
+            pass
+
+
 def test_setup_is_single_owner_and_protected_apis_require_login(client: TestClient) -> None:
     page = client.get("/")
     assert page.status_code == 200
-    assert "SCC | Server Control Center" in page.text
+    assert "SERVER CONTROL CENTER" in page.text
     assert page.headers["x-content-type-options"] == "nosniff"
     assert client.get("/api/dashboard").status_code == 401
     headers = bootstrap(client)
@@ -464,6 +478,64 @@ def test_nested_grants_enforce_permissions_and_revoke_access(client: TestClient)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_directory_listing_hides_ungranted_entries_but_keeps_nested_grant_ancestors(client: TestClient) -> None:
+    owner_headers = bootstrap(client)
+    user_id = create_user(client, owner_headers)
+    secret_dir = client.app.state.settings.filesystem_root / "private" / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "allowed.txt").write_text("allowed", encoding="utf-8")
+    grant(client, owner_headers, user_id, "/", sorted(PERMISSIONS))
+    grant(client, owner_headers, user_id, "/private", [], inherit=False)
+
+    login(client, "alice", USER_PASSWORD)
+    root_listing = client.get("/api/files?path=/").json()
+    assert "private" not in {item["name"] for item in root_listing["items"]}
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    owner_headers = login(client, "rootowner", OWNER_PASSWORD)
+    grant(client, owner_headers, user_id, "/private/secret", ["browse", "read"], inherit=True)
+    login(client, "alice", USER_PASSWORD)
+
+    root_listing = client.get("/api/files?path=/").json()
+    private = next(item for item in root_listing["items"] if item["name"] == "private")
+    assert private["restricted_ancestor"] is True
+    assert private["access"] == []
+    assert private["uid"] is None
+    assert client.get("/api/files?path=/private").status_code == 200
+    private_listing = client.get("/api/files?path=/private").json()
+    assert {item["name"] for item in private_listing["items"]} == {"secret"}
+    assert client.get("/api/files/read?path=/private/secret/allowed.txt").status_code == 200
+
+
+def test_login_rate_limit_applies_across_usernames_from_one_client_ip(client: TestClient) -> None:
+    bootstrap(client)
+    for index in range(20):
+        response = client.post(
+            "/api/auth/login",
+            headers={"Origin": "http://testserver"},
+            json={"username": f"missing{index}", "password": USER_PASSWORD},
+        )
+        assert response.status_code == 401
+    limited = client.post(
+        "/api/auth/login",
+        headers={"Origin": "http://testserver"},
+        json={"username": "another-missing", "password": USER_PASSWORD},
+    )
+    assert limited.status_code == 429
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_upload_request_body_is_bounded_before_multipart_processing(client: TestClient) -> None:
+    headers = bootstrap(client)
+    response = client.post(
+        "/api/files/upload?path=/team",
+        headers=headers,
+        files={"file": ("large.bin", b"x" * (300 * 1024), "application/octet-stream")},
+    )
+    assert response.status_code == 413
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
 def test_path_traversal_symlinks_and_range_download(client: TestClient) -> None:
     bootstrap(client)
     assert client.get("/api/files?path=/../private").status_code == 400
@@ -518,6 +590,36 @@ def test_upload_create_edit_rename_delete_and_no_overwrite(client: TestClient) -
         headers=csrf(client),
         json={"path": "/team/renamed.txt"},
     ).status_code == 200
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_file_and_folder_creation_respects_entry_limit(client: TestClient) -> None:
+    settings = replace(client.app.state.settings, max_entries=4)
+    with TestClient(create_app(settings)) as limited_client:
+        headers = bootstrap(limited_client)
+        response = limited_client.post(
+            "/api/files/mkdir",
+            headers=headers,
+            json={"path": "/team", "name": "too-many"},
+        )
+        assert response.status_code == 413
+        assert not (settings.filesystem_root / "team" / "too-many").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_upload_respects_aggregate_storage_quota_and_cleans_temporary_file(client: TestClient) -> None:
+    settings = replace(client.app.state.settings, max_storage_bytes=1024)
+    with TestClient(create_app(settings)) as limited_client:
+        headers = bootstrap(limited_client)
+        response = limited_client.post(
+            "/api/files/upload?path=/team",
+            headers=headers,
+            files={"file": ("quota.bin", b"x" * 1020, "application/octet-stream")},
+        )
+        assert response.status_code == 413
+        team = settings.filesystem_root / "team"
+        assert not (team / "quota.bin").exists()
+        assert not any(path.name.startswith(".scc-upload-") for path in team.iterdir())
 
 
 def test_regular_user_cannot_use_owner_apis_and_disabling_revokes_sessions(client: TestClient) -> None:
