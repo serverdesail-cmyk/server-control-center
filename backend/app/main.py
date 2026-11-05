@@ -807,6 +807,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def dashboard_page():
         return FileResponse(Path(__file__).parent / "static" / "index.html")
 
+    @app.get("/services", response_class=HTMLResponse)
+    async def services_page():
+        return FileResponse(Path(__file__).parent / "static" / "services.html")
+
+    @app.get("/minecraft", response_class=HTMLResponse)
+    async def minecraft_page():
+        return FileResponse(Path(__file__).parent / "static" / "minecraft.html")
+
     @app.get("/api/health")
     async def health():
         return {"status": "ok", "version": APP_VERSION}
