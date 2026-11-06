@@ -10,6 +10,8 @@ readonly SERVICE_USER="scc"
 readonly SERVICE_GROUP="scc"
 readonly DEFAULT_FILES_DIR="/srv/server-control-center-files"
 readonly WRAPPER="/usr/local/bin/scc"
+readonly PRIVILEGED_HELPER="/usr/local/libexec/scc-manager"
+readonly SUDOERS_FILE="/etc/sudoers.d/scc-manager-${SUDO_UID:-unknown}"
 
 log() { printf '[scc-install] %s\n' "$*"; }
 fail() { printf '[scc-install] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -49,6 +51,7 @@ docker compose version >/dev/null 2>&1 || packages+=(docker-compose)
 command -v git >/dev/null 2>&1 || packages+=(git)
 command -v curl >/dev/null 2>&1 || packages+=(curl)
 command -v openssl >/dev/null 2>&1 || packages+=(openssl)
+command -v sudo >/dev/null 2>&1 || packages+=(sudo)
 if ((${#packages[@]})); then
   log "Installing missing Arch packages: ${packages[*]}"
   pacman -S --needed --noconfirm "${packages[@]}" || fail "pacman could not install required packages. Update your system with a full system upgrade, then rerun this installer."
@@ -60,6 +63,8 @@ command -v git >/dev/null 2>&1 || fail "Git is required to fetch and update SCC.
 command -v tar >/dev/null 2>&1 || fail "tar is required to refresh the SCC installation."
 command -v curl >/dev/null 2>&1 || fail "curl is required for SCC health checks."
 command -v openssl >/dev/null 2>&1 || fail "OpenSSL is required to generate the one-time setup token."
+command -v sudo >/dev/null 2>&1 || fail "sudo is required for the restricted passwordless management launcher."
+command -v visudo >/dev/null 2>&1 || fail "visudo is required to validate the restricted management permission."
 command -v groupadd >/dev/null 2>&1 || fail "groupadd is required to create the dedicated SCC account."
 command -v useradd >/dev/null 2>&1 || fail "useradd is required to create the dedicated SCC account."
 
@@ -112,6 +117,7 @@ git clone --depth 1 "${REPOSITORY_URL}" "${source_dir}" || fail "Could not clone
 [[ -f "${source_dir}/backend/Dockerfile" ]] || fail "The downloaded repository is missing the backend image definition."
 [[ -f "${source_dir}/backend/app/main.py" ]] || fail "The downloaded repository is missing the SCC application."
 [[ -f "${source_dir}/management/scc" ]] || fail "The downloaded repository is missing the SCC management command."
+[[ -f "${source_dir}/management/scc-manager-helper" ]] || fail "The downloaded repository is missing the restricted SCC management helper."
 app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${source_dir}/backend/app/main.py")"
 compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${source_dir}/docker-compose.yml")"
 [[ -n "${app_version}" && "${app_version}" == "${compose_version}" ]] || fail "The downloaded application and Compose versions do not match."
@@ -148,11 +154,14 @@ git_backup_active=0
 [[ -f "${INSTALL_DIR}/backend/Dockerfile" ]] || fail "The repaired installation is missing the backend image definition."
 [[ -f "${INSTALL_DIR}/backend/app/main.py" ]] || fail "The repaired installation is missing the SCC application."
 [[ -x "${INSTALL_DIR}/management/scc" ]] || fail "The repaired management command is not executable."
+[[ -f "${INSTALL_DIR}/management/scc-manager-helper" ]] || fail "The repaired installation is missing the restricted management helper."
+chmod 0755 "${INSTALL_DIR}/management/scc-manager-helper"
 app_version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' "${INSTALL_DIR}/backend/app/main.py")"
 compose_version="$(sed -n 's/^[[:space:]]*image: scc-server-control-center:\([^[:space:]]*\)$/\1/p' "${INSTALL_DIR}/docker-compose.yml")"
 [[ -n "${app_version}" && "${app_version}" == "${compose_version}" ]] || fail "The repaired application and Compose versions do not match."
 bash -n "${INSTALL_DIR}/install-scc.sh" || fail "The repaired installer failed Bash syntax validation."
 bash -n "${INSTALL_DIR}/management/scc" || fail "The repaired management command failed Bash syntax validation."
+bash -n "${INSTALL_DIR}/management/scc-manager-helper" || fail "The restricted management helper failed Bash syntax validation."
 
 host_root="${DEFAULT_FILES_DIR}"
 if [[ -f "${env_file}" ]]; then
@@ -274,11 +283,31 @@ cat >"${WRAPPER}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 if [[ "${EUID}" -eq 0 ]]; then
-  exec bash /opt/server-control-center/management/scc "$@"
+  exec /usr/bin/bash /opt/server-control-center/management/scc "$@"
 fi
-exec sudo bash /opt/server-control-center/management/scc "$@"
+if ! command -v sudo >/dev/null 2>&1; then
+  printf 'scc: sudo is required for the restricted host management helper.\n' >&2
+  exit 1
+fi
+exec sudo -n /usr/local/libexec/scc-manager "$@"
 EOF
 chmod 0755 "${WRAPPER}"
+
+# Grant the installing account passwordless access to exactly one root-owned
+# dispatcher. The dispatcher has a strict command/argument allowlist and never
+# executes user-provided shell text. Docker access is not granted to the user
+# or to the application container.
+install -d -m 0755 /usr/local/libexec /etc/sudoers.d
+install -o root -g root -m 0755 "${INSTALL_DIR}/management/scc-manager-helper" "${PRIVILEGED_HELPER}"
+manager_user="$(getent passwd "${SUDO_UID}" | cut -d: -f1)"
+[[ -n "${manager_user}" && "${manager_user}" =~ ^[A-Za-z_][A-Za-z0-9_-]*[$]?$ ]] || fail "Could not safely determine the account for the restricted SCC management permission."
+sudoers_tmp="$(mktemp /etc/sudoers.d/.scc-manager.XXXXXX)"
+printf '%s ALL=(root) NOPASSWD: %s\n' "${manager_user}" "${PRIVILEGED_HELPER}" >"${sudoers_tmp}"
+chmod 0440 "${sudoers_tmp}"
+visudo -cf "${sudoers_tmp}" >/dev/null || { rm -f "${sudoers_tmp}"; fail "The restricted SCC sudoers rule did not pass validation."; }
+install -o root -g root -m 0440 "${sudoers_tmp}" "${SUDOERS_FILE}"
+rm -f "${sudoers_tmp}"
+visudo -cf /etc/sudoers >/dev/null || fail "The system sudoers configuration failed validation after installing the SCC rule."
 
 legacy_management="${LEGACY_INSTALL_DIR}/management/scc"
 if [[ -f "${legacy_management}" ]] \
@@ -318,11 +347,11 @@ for _ in $(seq 1 60); do
 done
 if [[ "${ready}" -ne 1 ]]; then
   docker compose --project-name scc --project-directory "${INSTALL_DIR}" --env-file "${env_file}" -f "${INSTALL_DIR}/docker-compose.yml" logs --tail 80 >&2
-  fail "SCC did not report expected version ${app_version} (reported: ${reported_version:-unavailable}). Check: sudo scc logs"
+  fail "SCC did not report expected version ${app_version} (reported: ${reported_version:-unavailable}). Check: scc logs"
 fi
 
 log "SCC ${reported_version} is healthy; existing account and audit data were retained."
 log "Open http://127.0.0.1:8787 on the server, or run: ngrok http 8787"
-log "Retrieve the one-time owner setup token securely with: sudo scc setup-token"
-log "Management: scc start|stop|restart|update|logs|status|uninstall"
+log "Retrieve the one-time owner setup token securely with: scc setup-token"
+log "Management (no sudo required): scc start|stop|restart|update|logs|status|storage-status|storage-reconcile|uninstall"
 log "SCC can access only ${host_root}; Linux filesystem permissions still apply."

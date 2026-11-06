@@ -21,10 +21,10 @@ Run the command from an unprivileged user account with `sudo`. The installer cre
 On the server, open `http://localhost:8787` and retrieve the one-time token in a terminal:
 
 ```sh
-sudo scc setup-token
+scc setup-token
 ```
 
-Enter that token, a username, and a password of at least 12 characters in the setup screen to create the Root_user account. Setup is single-use: the database enforces one privileged account (stored internally as `owner`). After setup, run `sudo scc setup-token` again to remove the now-unused token from the Compose environment.
+Enter that token, a username, and a password of at least 12 characters in the setup screen to create the Root_user account. Setup is single-use: the database enforces one privileged account (stored internally as `owner`). After setup, run `scc setup-token` again to remove the now-unused token from the Compose environment.
 
 Keep the owner credentials private. The setup token is not printed during installation or written to installer logs.
 
@@ -38,10 +38,10 @@ ngrok http http://127.0.0.1:8787
 
 Open the HTTPS URL displayed by ngrok. SCC still requires its own login; ngrok is only the transport.
 
-To allow direct LAN access, edit `/opt/server-control-center/.env` and set `SCC_BIND_ADDRESS` to the server's LAN address, then apply the change. `sudo scc restart` recreates the container so updated environment and mount settings take effect:
+To allow direct LAN access, edit `/opt/server-control-center/.env` and set `SCC_BIND_ADDRESS` to the server's LAN address, then apply the change. `scc restart` recreates the container so updated environment and mount settings take effect:
 
 ```sh
-sudo scc restart
+scc restart
 ```
 
 Configure the host firewall before doing this. `SCC_COOKIE_SECURE=true` is the recommended setting and requires HTTPS for browser sessions. Do not turn it off on an untrusted network.
@@ -52,7 +52,7 @@ By default, the only user-file directory mounted into the application is `/srv/s
 
 The active root can be changed in the owner panel without restarting. Changing it remaps grants that still point inside the new root and removes grants that would no longer refer to the same physical paths. The owner can browse and apply only directories inside the configured mount.
 
-To use a different dedicated host directory or expand the available host boundary, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, then run `sudo scc restart` to recreate the container with the new mount. The host root must not contain a colon. Only that one directory is mounted into the container.
+To use a different dedicated host directory or expand the available host boundary, update `SCC_HOST_ROOT` in `/opt/server-control-center/.env` to an existing absolute directory other than `/`, then run `scc restart` to recreate the container with the new mount. The host root must not contain a colon. Only that one directory is mounted into the container.
 
 SCC uses descriptor-relative Linux filesystem operations, refuses symbolic-link traversal, rejects `..` path components, and does not permit overwriting an existing file during upload or rename. Request bodies are capped before multipart parsing; individual uploads are limited to 50 MiB by default, and SCC enforces a 10 GiB aggregate regular-file storage ceiling plus a 100,000-entry ceiling across the configured mount. File/folder creation and uploads are serialized within the application process while these limits are checked. Downloads support HTTP byte ranges. Text editing is limited to UTF-8 files up to 1 MiB.
 
@@ -71,7 +71,7 @@ The installer migrates ownership of SCC's private state directory under `/var/li
 - File/folder listing, previews and bounded editing, create, range downloads, rename and delete. Multi-file uploads run one at a time with per-file and overall progress, visible failures, retry, and queue cancellation; a failed file does not discard the rest of the selection.
 - Root_user-selectable active filesystem root inside the fixed host mount, with safe grant remapping and an in-app directory picker.
 - Live host CPU, memory, uptime, load-average, network-counter, and filesystem-volume monitoring for the volume containing the active root. Resource warning thresholds and shared overview sections/actions are configurable by Root_user. A rolling 5-minute chart is held in the open browser session; selected `/proc` files are mounted read-only, and SCC does not inspect process command lines or control the host.
-- Separate Logs view with live server audit entries and per-account browser activity kept in that browser's local storage. Regular accounts see only their own server audit records; Root_user can see all. Raw container output remains host-only through `sudo scc logs`.
+- Separate Logs view with live server audit entries and per-account browser activity kept in that browser's local storage. Regular accounts see only their own server audit records; Root_user can see all. Raw container output remains host-only through `scc logs`.
 - Per-account profile pictures optimized in the browser and stored with the server-side account profile.
 - Six built-in color themes, safe JSON color-theme import/export, and per-device menu visibility and ordering. Menus can be reordered by drag-and-drop or accessible move controls.
 - Circular quick actions can be chosen per account and device; Root_user controls which shared dashboard sections and shortcuts are available.
@@ -83,18 +83,28 @@ SCC does not expose Docker resource controls, a browser terminal, public sharing
 
 ## Management
 
+Run SCC management commands from a normal terminal without typing `sudo`:
+
 ```sh
-sudo scc start
-sudo scc stop
-sudo scc restart
-sudo scc update
-sudo scc logs
-sudo scc status
-sudo scc setup-token
-sudo scc uninstall
+scc start
+scc stop
+scc restart
+scc update
+scc logs
+scc status
+scc setup-token
+scc uninstall
 ```
 
-`sudo scc update` fetches the latest code, rebuilds/recreates the container, then verifies that the health endpoint reports the version in the updated source. The installer performs the same version check. Account, profile, grant, session, and audit data remain in `/var/lib/server-control-center/data`; database initialization adds new columns/settings without replacing that database. Keep a backup of this directory before updates. If the configured host mount changes, an active root that is no longer within it safely resets to the new mount and stale grants are cleared.
+**Existing installations:** after updating the repository and running `scc update` once with the current setup, run this one-time migration:
+
+```sh
+sudo scc enable-passwordless
+```
+
+It installs a root-owned, narrowly allowlisted dispatcher and a sudoers rule for the Linux account that invoked the command. After that, use `scc ...` normally; the wrapper uses non-interactive restricted sudo internally. The user is not added to the Docker group, the application container remains unprivileged, and the Docker socket is not mounted into the container. The helper accepts only SCC management operations and validated quota arguments; it does not provide a general root shell.
+
+`scc update` continues to fetch the latest code from the configured GitHub repository using the existing `git pull --ff-only` workflow, rebuilds/recreates the container, then verifies that the health endpoint reports the version in the updated source. The installer performs the same version check. Account, profile, grant, session, and audit data remain in `/var/lib/server-control-center/data`; database initialization adds new columns/settings without replacing that database. Keep a backup of this directory before updates. If the configured host mount changes, an active root that is no longer within it safely resets to the new mount and stale grants are cleared.
 
 Uninstall asks before stopping/removing application files, then separately asks whether to delete persistent application data under `/var/lib/server-control-center/`. Answer no to retain that data.
 
@@ -171,17 +181,17 @@ level; the global limit still applies. Existing files remain unattributed until
 reconciliation; the reconciliation process preserves explicitly recorded owners
 and leaves unrecognized paths with unknown ownership.
 
-Administrative commands (run with `sudo`):
+Administrative commands (run directly; no `sudo` needed after the one-time management setup):
 
 ```bash
-sudo scc general-max --size 40
-sudo scc general-max --show
-sudo scc general-max --unlimited
-sudo scc user-max alice --size 8
-sudo scc user-max alice --show
-sudo scc user-max alice --unlimited
-sudo scc storage-status
-sudo scc storage-reconcile
+scc general-max --size 40
+scc general-max --show
+scc general-max --unlimited
+scc user-max alice --size 8
+scc user-max alice --show
+scc user-max alice --unlimited
+scc storage-status
+scc storage-reconcile
 ```
 
 The authenticated API exposes `/api/storage`, `/api/storage/global`,

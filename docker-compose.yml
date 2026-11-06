@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: scc-server-control-center:0.6.0
+    image: scc-server-control-center:0.6.1
     container_name: server-control-center
     init: true
     restart: unless-stopped
