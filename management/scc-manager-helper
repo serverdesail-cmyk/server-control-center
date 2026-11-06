@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Narrow privileged dispatcher for the unprivileged `scc` command.
+# This file is installed root-owned in /usr/local/libexec and is the only
+# command granted passwordless sudo by the installer.
+set -Eeuo pipefail
+
+readonly MANAGER="/opt/server-control-center/management/scc"
+
+fail() {
+  printf 'scc: %s\n' "$*" >&2
+  exit 2
+}
+
+[[ "${EUID}" -eq 0 ]] || fail "This helper must be invoked through its restricted sudo rule."
+[[ -f "${MANAGER}" && ! -L "${MANAGER}" ]] || fail "SCC management script is missing or unsafe."
+[[ -x "${MANAGER}" ]] || fail "SCC management script is not executable."
+
+(($# >= 1)) || fail "A management command is required. Run: scc help"
+command_name="$1"
+shift
+
+case "${command_name}" in
+  start|stop|restart|update|logs|status|setup-token|storage-status|storage-reconcile|uninstall|enable-passwordless)
+    (($# == 0)) || fail "${command_name} does not accept additional arguments."
+    ;;
+  general-max)
+    if [[ "$#" -eq 1 && ( "$1" == "--show" || "$1" == "--unlimited" ) ]]; then
+      :
+    elif [[ "$#" -eq 2 && "$1" == "--size" && "$2" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      :
+    else
+      fail "Usage: scc general-max --show | --unlimited | --size N"
+    fi
+    ;;
+  user-max)
+    [[ "$#" -ge 2 ]] || fail "Usage: scc user-max USER --show | --unlimited | --size N"
+    [[ "$1" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || fail "Invalid username."
+    if [[ "$#" -eq 2 && ( "$2" == "--show" || "$2" == "--unlimited" ) ]]; then
+      :
+    elif [[ "$#" -eq 3 && "$2" == "--size" && "$3" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      :
+    else
+      fail "Usage: scc user-max USER --show | --unlimited | --size N"
+    fi
+    ;;
+  help|--help|-h)
+    (($# == 0)) || fail "help does not accept additional arguments."
+    exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LANG=C /usr/bin/bash "${MANAGER}" --help
+    ;;
+  *)
+    fail "Unsupported management command '${command_name}'. No shell commands or arbitrary arguments are permitted."
+    ;;
+esac
+
+if [[ "${command_name}" == "uninstall" ]]; then
+  set +e
+  /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LANG=C SUDO_UID="${SUDO_UID:-}" /usr/bin/bash "${MANAGER}" uninstall
+  exit "$?"
+fi
+
+exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LANG=C SUDO_UID="${SUDO_UID:-}" /usr/bin/bash "${MANAGER}" "${command_name}" "$@"

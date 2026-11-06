@@ -22,7 +22,9 @@ usage() {
     "  user-max USER --size N GiB | --unlimited | --show" \
     "  storage-status Show global storage usage and quota" \
     "  storage-reconcile Reconcile storage ownership and sizes" \
-    "  uninstall   Remove SCC after explicit confirmation"
+    "  uninstall   Remove SCC after explicit confirmation" \
+    "  enable-passwordless Configure sudo-free SCC management (one-time setup)" \
+    "  help        Show this help"
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -61,6 +63,52 @@ verify_updated_version() {
   printf 'SCC did not report expected version %s after the update.\n' "${expected_version}" >&2
   compose logs --tail 80 >&2
   return 1
+}
+
+
+enable_passwordless_management() {
+  local invoking_uid invoking_user sudoers_file sudoers_tmp
+  invoking_uid="${SUDO_UID:-}"
+  [[ "${invoking_uid}" =~ ^[0-9]+$ && "${invoking_uid}" -ne 0 ]] || {
+    printf 'Run this once as: sudo scc enable-passwordless\n' >&2
+    return 1
+  }
+  invoking_user="$(getent passwd "${invoking_uid}" | cut -d: -f1)"
+  [[ -n "${invoking_user}" && "${invoking_user}" =~ ^[A-Za-z_][A-Za-z0-9_-]*[$]?$ ]] || {
+    printf 'Could not safely identify the invoking Linux account.\n' >&2
+    return 1
+  }
+  [[ -f "${APP_DIR}/management/scc-manager-helper" && ! -L "${APP_DIR}/management/scc-manager-helper" ]] || {
+    printf 'The restricted management helper is missing from the installed repository checkout. Update SCC first.\n' >&2
+    return 1
+  }
+  command -v visudo >/dev/null 2>&1 || { printf 'visudo is required to configure the restricted permission.\n' >&2; return 1; }
+  install -d -m 0755 /usr/local/libexec /etc/sudoers.d
+  install -o root -g root -m 0755 "${APP_DIR}/management/scc-manager-helper" /usr/local/libexec/scc-manager
+  sudoers_file="/etc/sudoers.d/scc-manager-${invoking_uid}"
+  sudoers_tmp="$(mktemp /etc/sudoers.d/.scc-manager.XXXXXX)"
+  printf '%s ALL=(root) NOPASSWD: /usr/local/libexec/scc-manager\n' "${invoking_user}" >"${sudoers_tmp}"
+  chmod 0440 "${sudoers_tmp}"
+  if ! visudo -cf "${sudoers_tmp}" >/dev/null; then
+    rm -f -- "${sudoers_tmp}"
+    printf 'The restricted sudoers rule failed validation; no permission was installed.\n' >&2
+    return 1
+  fi
+  install -o root -g root -m 0440 "${sudoers_tmp}" "${sudoers_file}"
+  rm -f -- "${sudoers_tmp}"
+  visudo -cf /etc/sudoers >/dev/null || { printf 'System sudoers validation failed. Review %s.\n' "${sudoers_file}" >&2; return 1; }
+  cat >/usr/local/bin/scc <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${EUID}" -eq 0 ]]; then
+  exec /usr/bin/bash /opt/server-control-center/management/scc "$@"
+fi
+exec sudo -n /usr/local/libexec/scc-manager "$@"
+EOF
+  chown root:root /usr/local/bin/scc
+  chmod 0755 /usr/local/bin/scc
+  printf 'Passwordless SCC management is enabled for %s.\n' "${invoking_user}"
+  printf 'Try: scc status\n'
 }
 
 storage_cli() {
@@ -167,6 +215,12 @@ PY
 }
 
 case "${1:-}" in
+  enable-passwordless)
+    enable_passwordless_management
+    ;;
+  help|--help|-h)
+    usage
+    ;;
   general-max|user-max|storage-status|storage-reconcile)
     storage_cli "$@"
     ;;
@@ -211,7 +265,10 @@ case "${1:-}" in
     read -r -p "Remove SCC application files and stop the service? [y/N] " answer
     [[ "${answer}" == [yY] ]] || { printf 'Uninstall canceled.\n'; exit 0; }
     compose down --remove-orphans
-    rm -f /usr/local/bin/scc
+    rm -f /usr/local/bin/scc /usr/local/libexec/scc-manager
+    if [[ "${SUDO_UID:-}" =~ ^[0-9]+$ ]]; then
+      rm -f -- "/etc/sudoers.d/scc-manager-${SUDO_UID}"
+    fi
     rm -rf -- "${APP_DIR}"
     printf 'SCC application files removed. Persistent data remains at %s.\n' "${DATA_DIR}"
     read -r -p "Also permanently delete persistent SCC data? [y/N] " delete_data
