@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_ATTEMPTS = 8
@@ -190,7 +190,11 @@ class PasswordBody(BaseModel):
 
 
 class GrantBody(BaseModel):
-    user_id: int = Field(gt=0)
+    # The UI now identifies the target account by its unique username rather
+    # than relying on a potentially stale numeric selection. user_id remains
+    # optional for backward compatibility with existing API clients.
+    user_id: int | None = Field(default=None, gt=0)
+    username: str | None = Field(default=None, min_length=3, max_length=32)
     path: str = Field(max_length=4096)
     permissions: list[str] = Field(max_length=len(PERMISSIONS))
     inherit: bool = True
@@ -2013,14 +2017,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target_path = virtual_path(path_parts)
         if any(permission not in PERMISSIONS for permission in body.permissions):
             raise HTTPException(status_code=422, detail="Unknown folder permission")
+        if body.username is None and body.user_id is None:
+            raise HTTPException(status_code=422, detail="Specify the target username")
         with closing(connect(config.database_path)) as db:
-            target_user = db.execute(
-                "SELECT id, role FROM users WHERE id = ? AND active = 1", (body.user_id,)
-            ).fetchone()
-            if target_user is None:
-                raise HTTPException(status_code=404, detail="Active user not found")
+            if body.username is not None:
+                target_user = db.execute(
+                    "SELECT id, username, role FROM users WHERE username = ? COLLATE NOCASE AND active = 1",
+                    (body.username.strip(),),
+                ).fetchone()
+                if target_user is None:
+                    raise HTTPException(status_code=404, detail="Active user not found")
+                # If a legacy client supplies both fields, reject a mismatch
+                # instead of silently granting access to the wrong account.
+                if body.user_id is not None and body.user_id != target_user["id"]:
+                    raise HTTPException(status_code=409, detail="Selected username and user ID do not match")
+            else:
+                target_user = db.execute(
+                    "SELECT id, username, role FROM users WHERE id = ? AND active = 1", (body.user_id,)
+                ).fetchone()
+                if target_user is None:
+                    raise HTTPException(status_code=404, detail="Active user not found")
             if target_user["role"] == "owner":
                 raise HTTPException(status_code=400, detail="The owner does not need folder grants")
+            target_user_id = target_user["id"]
+            target_username = target_user["username"]
+            target_role = target_user["role"]
         fd = open_directory(active_filesystem_root(config), path_parts)
         os.close(fd)
         with closing(connect(config.database_path)) as db:
@@ -2029,11 +2050,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 INSERT INTO grants (user_id, path, permissions, inherit) VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id, path) DO UPDATE SET permissions = excluded.permissions, inherit = excluded.inherit
                 """,
-                (body.user_id, target_path, json.dumps(sorted(set(body.permissions))), int(body.inherit)),
+                (target_user_id, target_path, json.dumps(sorted(set(body.permissions))), int(body.inherit)),
             )
             db.commit()
-        audit_event(config, user, "folder_grant_changed", target_path, target_user["role"])
-        return {"user_id": body.user_id, "path": target_path}
+        audit_event(config, user, "folder_grant_changed", target_path, target_username)
+        return {"user_id": target_user_id, "username": target_username, "path": target_path}
 
     @app.delete("/api/grants/{grant_id}")
     async def delete_grant(grant_id: int, user: CurrentUser):
