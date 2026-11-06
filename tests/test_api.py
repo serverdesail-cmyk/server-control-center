@@ -451,6 +451,36 @@ def test_login_rate_limit_and_owner_password_reset_revoke_sessions(client: TestC
     assert limited.status_code == 429
 
 
+def test_grant_target_is_resolved_by_username_and_rejects_mismatched_id(client: TestClient) -> None:
+    owner_headers = bootstrap(client)
+    first_user_id = create_user(client, owner_headers)
+    second_user = client.post(
+        "/api/users",
+        headers=owner_headers,
+        json={"username": "bob", "password": USER_PASSWORD, "role": "user"},
+    )
+    assert second_user.status_code == 200, second_user.text
+    second_user_id = second_user.json()["id"]
+
+    by_username = client.post(
+        "/api/grants",
+        headers=owner_headers,
+        json={"username": "bob", "path": "/team", "permissions": ["browse", "upload"]},
+    )
+    assert by_username.status_code == 200, by_username.text
+    assert by_username.json()["user_id"] == second_user_id
+
+    mismatch = client.post(
+        "/api/grants",
+        headers=owner_headers,
+        json={"username": "bob", "user_id": first_user_id, "path": "/private", "permissions": ["browse"]},
+    )
+    assert mismatch.status_code == 409
+
+    grants = client.get("/api/grants", headers=owner_headers).json()
+    assert [(item["username"], item["path"]) for item in grants] == [("bob", "/team")]
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
 def test_nested_grants_enforce_permissions_and_revoke_access(client: TestClient) -> None:
     owner_headers = bootstrap(client)
