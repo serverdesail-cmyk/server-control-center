@@ -1439,7 +1439,9 @@ function renderUsers(users) {
   select.replaceChildren();
   for (const user of users.filter((item) => item.role !== "owner")) {
     const option = document.createElement("option");
-    option.value = user.id;
+    // Use the unique account name as the form value. The API resolves it
+    // server-side, avoiding accidental grants to a different numeric user ID.
+    option.value = user.username;
     option.textContent = `${user.username} (${user.role})`;
     select.append(option);
   }
@@ -1645,7 +1647,7 @@ $("#grant-form").addEventListener("submit", async (event) => {
     await api("/api/grants", {
       method: "POST",
       body: JSON.stringify({
-        user_id: Number($("#grant-user").value),
+        username: $("#grant-user").value,
         path: $("#grant-path").value,
         permissions,
         inherit: $("#grant-inherit").checked,
