@@ -25,13 +25,14 @@ from pathlib import Path
 from typing import Annotated, Any, Iterator
 from urllib.parse import quote, urlsplit
 
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.7.0"
 SESSION_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_ATTEMPTS = 8
@@ -123,41 +124,128 @@ class Settings:
     def database_path(self) -> Path:
         return self.data_dir / "scc.sqlite3"
 
-
+    @property
+    def rcon_key_path(self) -> Path:
+        return self.data_dir / "minecraft-rcon.key"
 
 class MinecraftModerationBody(BaseModel):
     action: str = Field(pattern="^(kick|ban|pardon)$")
     player: str = Field(min_length=1, max_length=16, pattern="^[A-Za-z0-9_]+$")
     reason: str = Field(default="", max_length=160)
 
-def minecraft_rcon(command: str) -> str:
-    host = os.getenv("SCC_MC_RCON_HOST", "").strip()
-    password = os.getenv("SCC_MC_RCON_PASSWORD", "")
-    try: port = int(os.getenv("SCC_MC_RCON_PORT", "25575"))
-    except ValueError: raise HTTPException(status_code=503, detail="Minecraft RCON port is invalid")
-    if not host or not password:
-        raise HTTPException(status_code=503, detail="Minecraft RCON is not configured")
-    def packet(sock, request_id, kind, payload):
-        body = struct.pack("<ii", request_id, kind) + payload.encode("utf-8") + b"\x00\x00"
-        sock.sendall(struct.pack("<i", len(body)) + body)
-        size = struct.unpack("<i", sock.recv(4))[0]
-        data = b""
-        while len(data) < size:
-            chunk = sock.recv(size-len(data))
-            if not chunk: raise OSError("RCON connection closed")
-            data += chunk
-        rid, rtype = struct.unpack("<ii", data[:8])
-        if rid != request_id: raise OSError("Unexpected RCON response")
-        return data[8:-2].decode("utf-8", "replace")
+class MinecraftRconSettingsBody(BaseModel):
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(default=25575, ge=1, le=65535)
+    password: str | None = Field(default=None, min_length=12, max_length=256)
+
+
+def validate_rcon_host(host: str) -> str:
+    host = host.strip().rstrip(".")
+    if not host or any(character.isspace() for character in host):
+        raise HTTPException(status_code=422, detail="Enter a valid private Minecraft server host")
     try:
-        with socket.create_connection((host, port), timeout=3) as sock:
-            sock.settimeout(3)
-            if packet(sock, 1, 3, password) == "":
-                # Auth packet's body is empty on success in some implementations; verify via command response.
-                pass
-            return packet(sock, 2, 2, command)
-    except (OSError, struct.error) as exc:
-        raise HTTPException(status_code=502, detail=f"Minecraft RCON connection failed: {exc}")
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*", host):
+            raise HTTPException(status_code=422, detail="Enter a valid private Minecraft server host")
+        return host.lower()
+    if not address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified:
+        raise HTTPException(status_code=422, detail="RCON hosts must be private, non-loopback server addresses")
+    return str(address)
+
+
+def load_rcon_key(settings: Settings) -> bytes:
+    try:
+        fd = os.open(settings.rcon_key_path, os.O_RDONLY | NOFOLLOW | CLOEXEC)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="Minecraft credential encryption is unavailable") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Minecraft credential encryption is unavailable") from exc
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or (
+            os.name == "posix" and stat.S_IMODE(file_stat.st_mode) & 0o077
+        ):
+            raise HTTPException(status_code=503, detail="Minecraft credential key permissions are unsafe")
+        key = os.read(fd, 128).strip()
+    finally:
+        os.close(fd)
+    try:
+        Fernet(key)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Minecraft credential key is invalid") from exc
+    return key
+
+
+def minecraft_rcon(host: str, port: int, password: str, command: str) -> str:
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        safe_addresses = []
+        for family, socktype, proto, _, sockaddr in addresses:
+            address = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+            if (
+                not address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_multicast
+                or address.is_unspecified
+            ):
+                raise HTTPException(status_code=422, detail="RCON host must resolve only to private server addresses")
+            safe_addresses.append((family, socktype, proto, sockaddr))
+        if not safe_addresses:
+            raise HTTPException(status_code=422, detail="RCON host did not resolve to a private server address")
+
+        def recv_exact(sock: socket.socket, length: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < length:
+                block = sock.recv(length - len(chunks))
+                if not block:
+                    raise OSError("RCON connection closed")
+                chunks.extend(block)
+            return bytes(chunks)
+
+        def send_packet(sock: socket.socket, request_id: int, kind: int, payload: str) -> None:
+            body = struct.pack("<ii", request_id, kind) + payload.encode("utf-8") + b"\x00\x00"
+            sock.sendall(struct.pack("<i", len(body)) + body)
+
+        def receive_packet(sock: socket.socket) -> tuple[int, int, str]:
+            size = struct.unpack("<i", recv_exact(sock, 4))[0]
+            if size < 10 or size > 4096:
+                raise OSError("Invalid RCON packet size")
+            data = recv_exact(sock, size)
+            request_id, kind = struct.unpack("<ii", data[:8])
+            if data[-2:] != b"\x00\x00":
+                raise OSError("Invalid RCON packet terminator")
+            return request_id, kind, data[8:-2].decode("utf-8", "replace")
+
+        last_error: OSError | None = None
+        for family, socktype, proto, sockaddr in safe_addresses:
+            try:
+                with socket.socket(family, socktype, proto) as sock:
+                    sock.settimeout(3)
+                    sock.connect(sockaddr)
+                    send_packet(sock, 1, 3, password)
+                    auth_id, auth_kind, _ = receive_packet(sock)
+                    if auth_id == -1:
+                        raise HTTPException(status_code=502, detail="Minecraft RCON authentication failed")
+                    if auth_id != 1 or auth_kind != 2:
+                        raise OSError("Unexpected RCON authentication response")
+                    send_packet(sock, 2, 2, command)
+                    response_id, _, response = receive_packet(sock)
+                    if response_id != 2:
+                        raise OSError("Unexpected RCON command response")
+                    return response
+            except HTTPException:
+                raise
+            except OSError as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+    except HTTPException:
+        raise
+    except (OSError, socket.gaierror, struct.error) as exc:
+        raise HTTPException(status_code=502, detail="Minecraft RCON connection failed") from exc
+    raise HTTPException(status_code=502, detail="Minecraft RCON connection failed")
 
 class SetupBody(BaseModel):
     setup_token: str = Field(min_length=24, max_length=256)
@@ -268,6 +356,21 @@ def initialize(settings: Settings) -> None:
     settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "posix":
         os.chmod(settings.data_dir, 0o700)
+    try:
+        key_fd = os.open(
+            settings.rcon_key_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC,
+            0o600,
+        )
+    except FileExistsError:
+        pass
+    else:
+        try:
+            os.write(key_fd, Fernet.generate_key() + b"\n")
+            os.fsync(key_fd)
+        finally:
+            os.close(key_fd)
+    load_rcon_key(settings)
     if not settings.filesystem_root.is_dir():
         raise RuntimeError(f"Filesystem root does not exist: {settings.filesystem_root}")
     base_root = settings.filesystem_root.resolve(strict=True)
@@ -347,6 +450,13 @@ def initialize(settings: Settings) -> None:
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 mtime_ns INTEGER NOT NULL DEFAULT 0,
                 known INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS minecraft_rcon (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                password_encrypted BLOB NOT NULL,
                 updated_at INTEGER NOT NULL
             );
             """
@@ -607,6 +717,8 @@ def check_filename(name: str) -> None:
         or name in {".", ".."}
         or "/" in name
         or "\\" in name
+        or ":" in name
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
         or "\x00" in name
         or len(name.encode("utf-8")) > 255
     ):
@@ -1037,16 +1149,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        preview_request = request.url.path == "/api/files/preview"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN" if preview_request else "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         if config.cookie_secure:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
-            "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
-        )
+        if preview_request:
+            response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'self'"
+        else:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; connect-src 'self' https://api.modrinth.com; "
+                "frame-src 'self'; object-src 'none'; base-uri 'self'; "
+                "frame-ancestors 'none'; form-action 'self'"
+            )
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1622,6 +1739,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=headers,
         )
 
+    @app.get("/api/files/preview")
+    async def preview_pdf(request: Request, path: str, user: CurrentUser):
+        parts = canonical_parts(path)
+        target = virtual_path(parts)
+        if not parts or not parts[-1].lower().endswith(".pdf"):
+            raise HTTPException(status_code=415, detail="Only PDF files can be previewed")
+        with closing(connect(config.database_path)) as db:
+            require_permission(db, user, target, "read")
+        parent_fd, name = open_parent(active_filesystem_root(config), parts)
+        try:
+            fd = os.open(name, os.O_RDONLY | NONBLOCK | NOFOLLOW | CLOEXEC, dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            os.close(parent_fd)
+            raise HTTPException(status_code=404, detail="File not found") from exc
+        except PermissionError as exc:
+            os.close(parent_fd)
+            raise HTTPException(status_code=403, detail="Filesystem access denied") from exc
+        except OSError as exc:
+            os.close(parent_fd)
+            if exc.errno == errno.ELOOP:
+                raise HTTPException(status_code=403, detail="Symbolic links are not followed") from exc
+            raise HTTPException(status_code=400, detail="File cannot be opened") from exc
+        os.close(parent_fd)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=400, detail="Only regular files can be previewed")
+        if os.read(fd, 5) != b"%PDF-":
+            os.close(fd)
+            raise HTTPException(status_code=415, detail="File does not contain a PDF document")
+        try:
+            start, end, status = range_bounds(request.headers.get("range"), file_stat.st_size)
+        except HTTPException as exc:
+            os.close(fd)
+            if exc.status_code == 416:
+                exc.headers = {"Content-Range": f"bytes */{file_stat.st_size}"}
+            raise
+        length = max(0, end - start + 1)
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}",
+        }
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_stat.st_size}"
+        audit_event(config, user, "file_preview", target)
+        return StreamingResponse(
+            read_chunks(fd, start, length),
+            status_code=status,
+            media_type="application/pdf",
+            headers=headers,
+        )
+
     @app.post("/api/files/mkdir")
     async def create_folder(body: CreateBody, user: CurrentUser):
         parent_parts = canonical_parts(body.path)
@@ -2068,25 +2238,117 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         audit_event(config, user, "folder_grant_deleted", row["path"])
         return {"ok": True}
 
-    @app.get("/api/minecraft/status")
-    async def minecraft_status(_: CurrentUser):
-        configured = bool(os.getenv("SCC_MC_RCON_HOST") and os.getenv("SCC_MC_RCON_PASSWORD"))
-        if not configured:
-            return {"configured": False, "online": False, "address": "", "players": None, "message": "Set SCC_MC_RCON_HOST, SCC_MC_RCON_PORT, and SCC_MC_RCON_PASSWORD to connect."}
+    @app.get("/api/minecraft/config")
+    async def minecraft_config(user: CurrentUser):
+        with closing(connect(config.database_path)) as db:
+            row = db.execute(
+                "SELECT host, port FROM minecraft_rcon WHERE user_id = ?", (user["id"],)
+            ).fetchone()
+        if row is None:
+            return {"configured": False, "host": "", "port": 25575}
+        return {
+            "configured": True,
+            "host": row["host"],
+            "port": row["port"],
+            "password_set": True,
+        }
+
+    @app.put("/api/minecraft/config")
+    async def save_minecraft_config(body: MinecraftRconSettingsBody, user: CurrentUser):
+        host = validate_rcon_host(body.host)
+        with closing(connect(config.database_path)) as db:
+            existing = db.execute(
+                "SELECT password_encrypted FROM minecraft_rcon WHERE user_id = ?", (user["id"],)
+            ).fetchone()
+        if body.password is None:
+            if existing is None:
+                raise HTTPException(status_code=422, detail="Enter an RCON password to configure this account")
+            encrypted_password = existing["password_encrypted"]
+        else:
+            encrypted_password = Fernet(load_rcon_key(config)).encrypt(body.password.encode("utf-8"))
+        with closing(connect(config.database_path)) as db:
+            db.execute(
+                """
+                INSERT INTO minecraft_rcon (user_id, host, port, password_encrypted, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    host = excluded.host,
+                    port = excluded.port,
+                    password_encrypted = excluded.password_encrypted,
+                    updated_at = excluded.updated_at
+                """,
+                (user["id"], host, body.port, encrypted_password, now()),
+            )
+            db.commit()
+        audit_event(config, user, "minecraft_rcon_configured", f"{host}:{body.port}")
+        return {"ok": True, "configured": True}
+
+    @app.delete("/api/minecraft/config")
+    async def delete_minecraft_config(user: CurrentUser):
+        with closing(connect(config.database_path)) as db:
+            db.execute("DELETE FROM minecraft_rcon WHERE user_id = ?", (user["id"],))
+            db.commit()
+        audit_event(config, user, "minecraft_rcon_removed")
+        return {"ok": True, "configured": False}
+
+    def account_rcon_settings(user: sqlite3.Row) -> tuple[str, int, str] | None:
+        with closing(connect(config.database_path)) as db:
+            row = db.execute(
+                "SELECT host, port, password_encrypted FROM minecraft_rcon WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()
+        if row is None:
+            return None
         try:
-            response = minecraft_rcon("list")
-            return {"configured": True, "online": True, "address": f"{os.getenv('SCC_MC_RCON_HOST')}:{os.getenv('SCC_MC_RCON_PORT','25575')}", "players": response, "message": response}
+            password = Fernet(load_rcon_key(config)).decrypt(row["password_encrypted"]).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=503, detail="Saved Minecraft credentials cannot be decrypted") from exc
+        return row["host"], row["port"], password
+
+    @app.get("/api/minecraft/status")
+    async def minecraft_status(user: CurrentUser):
+        settings = account_rcon_settings(user)
+        if settings is None:
+            return {
+                "configured": False,
+                "online": False,
+                "address": "",
+                "players": None,
+                "message": "Enter this account's RCON host, port, and password to connect.",
+            }
+        host, port, password = settings
+        address = f"{host}:{port}"
+        try:
+            response = minecraft_rcon(host, port, password, "list")
+            return {
+                "configured": True,
+                "online": True,
+                "address": address,
+                "players": response,
+                "message": response,
+            }
         except HTTPException as exc:
-            return {"configured": True, "online": False, "address": f"{os.getenv('SCC_MC_RCON_HOST')}:{os.getenv('SCC_MC_RCON_PORT','25575')}", "players": None, "message": exc.detail}
+            return {
+                "configured": True,
+                "online": False,
+                "address": address,
+                "players": None,
+                "message": exc.detail,
+            }
 
     @app.post("/api/minecraft/moderate")
     async def minecraft_moderate(body: MinecraftModerationBody, user: CurrentUser):
-        require_owner(user)
+        settings = account_rcon_settings(user)
+        if settings is None:
+            raise HTTPException(status_code=409, detail="Configure this account's Minecraft RCON connection first")
+        host, port, password = settings
         reason = body.reason.strip()
+        if any(ord(character) < 32 or ord(character) == 127 for character in reason):
+            raise HTTPException(status_code=422, detail="Moderation reasons cannot contain control characters")
         command = body.action + " " + body.player
         if body.action in {"kick", "ban"} and reason:
             command += " " + reason
-        response = minecraft_rcon(command)
+        response = minecraft_rcon(host, port, password, command)
         audit_event(config, user, "minecraft_moderation", body.player, body.action)
         return {"ok": True, "response": response or "Command sent."}
 
