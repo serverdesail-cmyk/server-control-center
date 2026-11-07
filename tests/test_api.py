@@ -139,6 +139,18 @@ def test_setup_is_single_owner_and_protected_apis_require_login(client: TestClie
     assert headers["X-CSRF-Token"] == client.cookies.get("scc_csrf")
 
 
+def test_standalone_pages_use_same_origin_scripts_and_csrf_logout(client: TestClient) -> None:
+    bootstrap(client)
+    minecraft = client.get("/minecraft")
+    services = client.get("/services")
+    assert minecraft.status_code == services.status_code == 200
+    assert '<script src="/assets/minecraft.js" defer></script>' in minecraft.text
+    assert '<script src="/assets/services.js" defer></script>' in services.text
+    assert "Content-Security-Policy" in minecraft.headers
+    assert client.get("/assets/minecraft.js").status_code == 200
+    assert client.get("/assets/services.js").status_code == 200
+
+
 def test_existing_database_is_migrated_without_losing_owner_or_audit(client: TestClient) -> None:
     bootstrap(client)
     database_path = client.app.state.settings.database_path
@@ -451,6 +463,7 @@ def test_login_rate_limit_and_owner_password_reset_revoke_sessions(client: TestC
     assert limited.status_code == 429
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux secure filesystem access.")
 def test_grant_target_is_resolved_by_username_and_rejects_mismatched_id(client: TestClient) -> None:
     owner_headers = bootstrap(client)
     first_user_id = create_user(client, owner_headers)
@@ -577,6 +590,141 @@ def test_path_traversal_symlinks_and_range_download(client: TestClient) -> None:
     assert response.status_code == 206
     assert response.content == b"ell"
     assert response.headers["content-range"] == "bytes 1-3/5"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_arbitrary_binary_upload_keeps_files_non_executable(client: TestClient) -> None:
+    headers = bootstrap(client)
+    binary = b"\x7fELF\x00opaque uploaded bytes\x00\xff"
+    response = client.post(
+        "/api/files/upload?path=/team",
+        headers=headers,
+        files={"file": ("unknown-runtime.bin", binary, "application/x-executable")},
+    )
+    assert response.status_code == 200, response.text
+    uploaded = client.app.state.settings.filesystem_root / "team" / "unknown-runtime.bin"
+    assert uploaded.read_bytes() == binary
+    assert uploaded.stat().st_mode & 0o111 == 0
+    assert uploaded.stat().st_mode & 0o777 == 0o600
+
+    invalid_name = client.post(
+        "/api/files/upload?path=/team",
+        headers=csrf(client),
+        files={"file": ("file.txt:stream", b"data", "text/plain")},
+    )
+    assert invalid_name.status_code == 400
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
+def test_pdf_preview_requires_read_grant_and_is_inline_pdf(client: TestClient) -> None:
+    pdf = client.app.state.settings.filesystem_root / "team" / "guide.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nsafe placeholder pdf bytes\n")
+    owner_headers = bootstrap(client)
+    user_id = create_user(client, owner_headers)
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "alice", USER_PASSWORD)
+    denied = client.get("/api/files/preview?path=/team/guide.pdf")
+    assert denied.status_code == 403
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    owner_headers = login(client, "rootowner", OWNER_PASSWORD)
+    grant(client, owner_headers, user_id, "/team", ["browse", "read"])
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "alice", USER_PASSWORD)
+    preview = client.get("/api/files/preview?path=/team/guide.pdf")
+    assert preview.status_code == 200
+    assert preview.headers["content-type"] == "application/pdf"
+    assert preview.headers["content-disposition"].startswith("inline;")
+    assert preview.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'self'"
+    assert preview.content.startswith(b"%PDF-")
+
+    not_pdf = client.get("/api/files/preview?path=/team/hello.txt")
+    assert not_pdf.status_code == 415
+
+
+def test_minecraft_rcon_settings_are_encrypted_and_account_scoped(client: TestClient) -> None:
+    owner_headers = bootstrap(client)
+    saved = client.put(
+        "/api/minecraft/config",
+        headers=owner_headers,
+        json={"host": "192.168.1.20", "port": 25575, "password": "a-strong-private-rcon-password"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert client.get("/api/minecraft/config").json() == {
+        "configured": True,
+        "host": "192.168.1.20",
+        "port": 25575,
+        "password_set": True,
+    }
+
+    with sqlite3.connect(client.app.state.settings.database_path) as db:
+        encrypted = db.execute(
+            "SELECT password_encrypted FROM minecraft_rcon"
+        ).fetchone()[0]
+    assert b"a-strong-private-rcon-password" not in encrypted
+    assert "a-strong-private-rcon-password" not in client.get("/api/minecraft/config").text
+    changed_host = client.put(
+        "/api/minecraft/config",
+        headers=csrf(client),
+        json={"host": "192.168.1.21", "port": 25576},
+    )
+    assert changed_host.status_code == 200
+    with sqlite3.connect(client.app.state.settings.database_path) as db:
+        updated_encrypted = db.execute(
+            "SELECT password_encrypted FROM minecraft_rcon"
+        ).fetchone()[0]
+    assert updated_encrypted == encrypted
+
+    public_host = client.put(
+        "/api/minecraft/config",
+        headers=csrf(client),
+        json={"host": "8.8.8.8", "port": 25575, "password": "a-strong-private-rcon-password"},
+    )
+    assert public_host.status_code == 422
+    bad_csrf = client.put(
+        "/api/minecraft/config",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": "invalid"},
+        json={"host": "192.168.1.20", "port": 25575, "password": "a-strong-private-rcon-password"},
+    )
+    assert bad_csrf.status_code == 403
+
+    client.post("/api/auth/logout", headers=csrf(client))
+    create_user(client, login(client, "rootowner", OWNER_PASSWORD))
+    client.post("/api/auth/logout", headers=csrf(client))
+    login(client, "alice", USER_PASSWORD)
+    assert client.get("/api/minecraft/config").json()["configured"] is False
+    assert client.post(
+        "/api/minecraft/moderate",
+        headers=csrf(client),
+        json={"action": "kick", "player": "Example"},
+    ).status_code == 409
+
+
+def test_minecraft_moderation_uses_calling_accounts_credentials(client: TestClient, monkeypatch) -> None:
+    from backend.app import main
+
+    headers = bootstrap(client)
+    client.put(
+        "/api/minecraft/config",
+        headers=headers,
+        json={"host": "minecraft.internal", "port": 25575, "password": "a-strong-private-rcon-password"},
+    )
+    calls = []
+
+    def fake_rcon(host, port, password, command):
+        calls.append((host, port, password, command))
+        return "Moderation action accepted"
+
+    monkeypatch.setattr(main, "minecraft_rcon", fake_rcon)
+    response = client.post(
+        "/api/minecraft/moderate",
+        headers=csrf(client),
+        json={"action": "kick", "player": "Example", "reason": "testing"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["response"] == "Moderation action accepted"
+    assert calls == [("minecraft.internal", 25575, "a-strong-private-rcon-password", "kick Example testing")]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux openat filesystem APIs.")
