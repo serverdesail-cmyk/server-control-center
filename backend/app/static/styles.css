@@ -320,6 +320,9 @@ input[type="checkbox"] { accent-color: var(--primary); }
 .fine { margin: 16px 0 0; font-size: 10px; line-height: 1.5; }
 .editor-dialog { width: min(900px, calc(100vw - 28px)); height: min(78vh, 760px); border: 1px solid var(--border); border-radius: 14px; padding: 0; color: var(--text); background: var(--surface); }
 .editor-dialog::backdrop { background: rgba(4, 5, 9, .74); backdrop-filter: blur(5px); }
+.pdf-preview-dialog { width: min(1100px, calc(100vw - 28px)); height: min(88vh, 900px); max-height: 88vh; border: 1px solid var(--border); border-radius: 14px; padding: 0; color: var(--text); background: var(--surface); }
+.pdf-preview-dialog::backdrop { background: rgba(4, 5, 9, .74); backdrop-filter: blur(5px); }
+.pdf-preview-dialog iframe { width: calc(100% - 28px); height: calc(100% - 82px); min-height: 360px; display: block; margin: 14px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
 .reset-dialog { width: min(440px, calc(100vw - 28px)); border: 1px solid var(--border); border-radius: 14px; padding: 22px; color: var(--text); background: var(--surface); }
 .reset-dialog::backdrop { background: rgba(4, 5, 9, .74); backdrop-filter: blur(5px); }
 .reset-dialog h2 { margin: 0; font-size: 17px; }

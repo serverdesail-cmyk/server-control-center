@@ -926,8 +926,9 @@ function makeFileRow(item) {
   if (item.kind === "folder") {
     title.addEventListener("click", () => loadFiles(`${state.path === "/" ? "" : state.path}/${item.name}`));
   } else if (item.kind === "file" && item.access.includes("read")) {
-    title.title = `${item.name} · double-click to open`;
-    title.addEventListener("dblclick", () => openEditor(item));
+    const isPdf = item.name.toLowerCase().endsWith(".pdf");
+    title.title = `${item.name} · double-click to ${isPdf ? "preview" : "open"}`;
+    title.addEventListener("dblclick", () => isPdf ? openPdfPreview(item) : openEditor(item));
   } else if (item.access.includes("download")) {
     title.addEventListener("click", () => downloadFile(item));
   }
@@ -960,7 +961,13 @@ function makeFileRow(item) {
   if (item.kind === "file" && item.access.includes("download")) addAction(menuItems, "↓", "Download", () => downloadFile(item));
   if (item.kind === "file" && item.access.includes("read")) {
     const canEdit = item.access.includes("edit");
-    addAction(menuItems, canEdit ? "✎" : "◉", canEdit ? "Edit" : "Read", () => openEditor(item));
+    const isPdf = item.name.toLowerCase().endsWith(".pdf");
+    addAction(
+      menuItems,
+      isPdf ? "▧" : canEdit ? "✎" : "◉",
+      isPdf ? "Preview PDF" : canEdit ? "Edit" : "Read",
+      () => isPdf ? openPdfPreview(item) : openEditor(item),
+    );
   }
   if (item.access.includes("rename")) addAction(menuItems, "✎", "Rename", () => renameFile(item));
   if (item.access.includes("delete")) addAction(menuItems, "⌫", "Delete", () => deleteFile(item), "danger");
@@ -995,6 +1002,17 @@ function downloadFile(item) {
   link.click();
   link.remove();
 }
+
+function openPdfPreview(item) {
+  const path = `${state.path === "/" ? "" : state.path}/${item.name}`;
+  $("#pdf-preview-title").textContent = item.name;
+  $("#pdf-preview-frame").src = `/api/files/preview?path=${encodeURIComponent(path)}`;
+  $("#pdf-preview-dialog").showModal();
+  recordClientActivity("pdf_preview_opened");
+}
+
+$("#pdf-preview-close").addEventListener("click", () => $("#pdf-preview-dialog").close());
+$("#pdf-preview-dialog").addEventListener("close", () => { $("#pdf-preview-frame").src = "about:blank"; });
 
 async function openEditor(item) {
   const path = `${state.path === "/" ? "" : state.path}/${item.name}`;
@@ -1872,4 +1890,3 @@ $$(".main-nav .nav-item").forEach((item) => {
 });
 
 bootstrap();
-
