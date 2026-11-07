@@ -19,6 +19,8 @@ Docker containers share the host kernel. This is meaningful isolation, but it is
 - Directory listings omit entries without grants. Ancestor folders needed to reach a deeper grant are shown by name and type only, without metadata.
 - Filesystem operations use Linux descriptor-relative APIs, reject traversal, and do not follow symlinks.
 - Upload request bodies are bounded before multipart parsing, individual files have a configurable size cap, and the configured file mount has aggregate regular-file byte and entry-count caps.
+- Upload content is treated as opaque bytes: SCC does not execute uploaded files, uses mode `0600` for newly uploaded files, and exposes downloads as attachments. Arbitrary uploads are not rendered inline. The PDF preview only serves `.pdf` files with a PDF signature, to an authenticated account with `read` permission, as `application/pdf` in a same-origin frame under a restrictive CSP. Keep managed directories away from host services that automatically execute or load their contents; file mode does not prevent an interpreter or another service from reading a file.
+- Each account's Minecraft RCON password is Fernet-encrypted and stored separately from account settings in SQLite. The Fernet key is a mode-`0600` file in the SCC private data directory; protect and back it up with the database. RCON configuration only permits private, non-loopback hosts, and DNS results are validated again immediately before the connection. Keep the RCON listener private and use a strong unique password.
 - Login attempts are limited per username/client address and across all usernames per client address.
 - Mutating browser requests require same-host Origin and CSRF validation.
 
@@ -29,6 +31,8 @@ The host listener defaults to loopback. For remote access, put SCC behind an HTT
 `SCC_TRUSTED_PROXY_CIDRS` controls which proxy peer networks may supply the client address through `X-Forwarded-For`. Keep this list limited to the actual local proxy/Docker bridge. Do not add arbitrary internet ranges. The default includes Docker's private bridge ranges and loopback for the intended local-tunnel deployment.
 
 The Compose network is a project-scoped bridge, not a host network. It is not an outbound firewall: SCC may need outbound access for explicitly configured integrations such as Minecraft RCON. Do not add blanket private-network `iptables` blocks without accounting for those integrations and the host's network design.
+
+Minecraft RCON settings are scoped to the logged-in account. The RCON integration sends only the supported `list`, `kick`, `ban`, and `pardon` commands. It resolves configured names and rejects any DNS answer that is not a private, non-loopback address before connecting. Private-network access is still a sensitive capability: configure RCON only on the intended Minecraft host, restrict it with host firewall rules, and use a strong unique RCON password.
 
 ## Storage quota limitation
 
